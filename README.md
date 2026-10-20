@@ -105,6 +105,26 @@ sudo chmod 755 /usr/local/bin/oci-cn
 sudo oci-cn
 ```
 
+## 卸载 Uninstall
+
+三种方式任选 / Three options:
+
+1. 主菜单选 `3 卸载`，可选择连配置目录和 oci-cli 一起卸。
+   Main menu option `3 Uninstall` — optionally removes the config directory and oci-cli too.
+
+2. 一键卸载脚本（通用版：自动查找常见安装位置，包括 /tmp 下的拷贝；带日期的备份文件不会误删）：
+   Universal uninstall script (auto-finds common install locations, incl. copies under /tmp; dated backup files are kept):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/oci-cn-tool/master/uninstall.sh | sudo bash
+```
+
+全自动（程序+配置+oci-cli 全卸，不询问）/ Fully automatic (program + config + oci-cli, no prompts):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/oci-cn-tool/master/uninstall.sh | sudo bash -s -- -y
+```
+
 ## 日常使用 Daily Usage
 
 每次使用只需一条命令（需 sudo，因为配置文件和 API 密钥存放在 `/root/.oci-cn`）：

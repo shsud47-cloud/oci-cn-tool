@@ -5,8 +5,19 @@
 L_MAIN_TITLE="oci-cn v%s — Oracle Cloud Management"
 L_MENU_ACCOUNT="1 Account List"
 L_MENU_SYSTEM="2 System Config"
+L_MENU_UNINSTALL="3 Uninstall"
 L_MENU_EXIT="0 Exit"
 L_CHOOSE="Choose"
+
+# Uninstall
+L_UNINSTALL_TITLE="-- Uninstall oci-cn --"
+L_UNINSTALL_FILES="This will delete the program and language pack: "
+L_UNINSTALL_NEEDROOT="Program file is not writable; please run with sudo and retry"
+L_UNINSTALL_ASK_CFG="Also delete the config directory (accounts and encrypted keys, cannot be recovered)? [y/N]: "
+L_UNINSTALL_ASK_CLI="Also uninstall oci-cli? [y/N]: "
+L_UNINSTALL_CONFIRM="Confirm uninstall? Type yes to continue: "
+L_UNINSTALL_FAIL="Failed to delete the program file"
+L_UNINSTALL_DONE="Uninstalled. Goodbye."
 
 # Account menu
 L_ACCT_TITLE="Account: %s    Region: %s %s"

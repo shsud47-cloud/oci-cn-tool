@@ -326,3 +326,9 @@ sudo oci-cn
 ## 配置恢复（私人仓库）
 
 `server-config/` 是生产机完整配置（14 个租户，私钥加密存放，解密密码 `admin`）。下载仓库后把 `server-config/` 内容拷到 `/root/.oci-cn/`（去掉 README 和 crontab 文件，chmod 700 / 密钥 600），运行 `sudo oci-cn` 输入密码 `admin` 即可使用。详见 `server-config/README.md`。
+
+---
+
+## 卸载 Uninstall
+
+三种方式：主菜单 ；或运行一键卸载脚本 （全自动加 ：）。

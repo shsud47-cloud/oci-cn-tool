@@ -5,7 +5,7 @@
 set -o pipefail
 umask 077
 
-VERSION="6.10.1"
+VERSION="6.10.2"
 
 # 全局关闭 oci 的文件权限警告，否则它会混进 stdout 冲垮 jq
 export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
@@ -2577,15 +2577,40 @@ cli_list_rules(){
   _show_effective
 }
 
+uninstall_self(){
+  local self selfdir c delcfg delcli _uh
+  self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  selfdir="$(dirname "$self")"
+  echo
+  echo " $(_t "── 卸载 oci-cn ──" "L_UNINSTALL_TITLE")"
+  echo " $(_t "将删除主程序和语言包：" "L_UNINSTALL_FILES")$self"
+  [ -w "$self" ] || { echo " $(_t "主程序不可写，请用 sudo 运行后再卸载" "L_UNINSTALL_NEEDROOT")"; pause; return; }
+  _ask -rp " $(_t "同时删除配置目录（含账号与加密密钥，不可恢复）？[y/N]: " "L_UNINSTALL_ASK_CFG")" delcfg
+  _ask -rp " $(_t "同时卸载 oci-cli？[y/N]: " "L_UNINSTALL_ASK_CLI")" delcli
+  _ask -rp " $(_t "确认卸载？输 yes 继续: " "L_UNINSTALL_CONFIRM")" c
+  [ "$c" = "yes" ] || { echo " $(_t "已取消" "L_CANCELLED")"; return; }
+  rm -f "$self" || { echo " $(_t "删除主程序失败" "L_UNINSTALL_FAIL")"; pause; return; }
+  rm -rf "$selfdir/lang"
+  case "$delcfg" in y|Y) rm -rf "$HOME_DIR";; esac
+  case "$delcli" in y|Y)
+    rm -f "$HOME/bin/oci" /usr/local/bin/oci 2>/dev/null
+    rm -rf "$HOME/lib/oracle-cli" "$HOME/.oci" 2>/dev/null
+    [ -n "$SUDO_USER" ] && { _uh="$(eval echo "~$SUDO_USER")"; rm -f "$_uh/bin/oci" 2>/dev/null; rm -rf "$_uh/lib/oracle-cli" "$_uh/.oci" 2>/dev/null; }
+    ;; esac
+  echo " $(_t "卸载完成。再见。" "L_UNINSTALL_DONE")"
+  exit 0
+}
+
 main(){
   unlock; prepare_runtime
   while true; do
     echo; line; printf "  $(_t "oci-cn v%s  —  甲骨文云中文管理" "L_MAIN_TITLE" "$VERSION")\n" "$VERSION"; line
-    echo " $(_t "1 配置列表（进入账号）" "L_MENU_ACCOUNT")"; echo " $(_t "2 系统配置" "L_MENU_SYSTEM")"; echo " $(_t "0 退出" "L_MENU_EXIT")"
+    echo " $(_t "1 配置列表（进入账号）" "L_MENU_ACCOUNT")"; echo " $(_t "2 系统配置" "L_MENU_SYSTEM")"; echo " $(_t "3 卸载" "L_MENU_UNINSTALL")"; echo " $(_t "0 退出" "L_MENU_EXIT")"
     _ask -rp "$(_t "选择" "L_CHOOSE"): " m
     case "$m" in
       1) list_accounts || { pause; continue; }; _ask -rp "$(_t "账号编号" "L_CHOOSE"): " idx; row=$(get_account_by_index "$idx"); [ -z "$row" ] && { echo "$(_t "无效" "L_INVALID")"; continue; }; account_page "$row";;
       2) sys_menu;;
+      3) uninstall_self;;
       0) echo "$(_t "已清除内存密钥。再见。" "L_GOODBYE")"; exit 0;;
     esac
   done
