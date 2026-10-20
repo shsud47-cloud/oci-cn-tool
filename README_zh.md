@@ -331,4 +331,13 @@ sudo oci-cn
 
 ## 卸载 Uninstall
 
-三种方式：主菜单 ；或运行一键卸载脚本 （全自动加 ：）。
+三种方式任选其一：
+
+1. 主菜单选「3 卸载」，可连配置目录和 oci-cli 一起卸。
+2. 一键卸载脚本（交互询问）：
+
+    curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/oci-cn-tool/master/uninstall.sh | sudo bash
+
+3. 一键卸载脚本（全自动，程序+配置+oci-cli 全卸）：
+
+    curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/oci-cn-tool/master/uninstall.sh | sudo bash -s -- -y
