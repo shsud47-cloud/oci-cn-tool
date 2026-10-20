@@ -1,0 +1,2765 @@
+#!/usr/bin/env bash
+# oci-cn —— 中文菜单 OCI 管理工具（基于官方 oci-cli），替代 oci-helper
+# 运行在面板机。密钥加密存放，运行时解密到 /dev/shm，退出即焚。
+# 一个账号一份配置，区域实时从 API 读取，主区域自动标注。
+set -o pipefail
+umask 077
+
+VERSION="6.10.1"
+
+# 全局关闭 oci 的文件权限警告，否则它会混进 stdout 冲垮 jq
+export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+export SUPPRESS_LABEL_WARNING=True   # 私钥无 OCI_API_KEY 标签时不再输出警告（会混入结果）
+
+# ============ 路径 ============
+HOME_DIR="${OCI_CN_HOME:-$HOME/.oci-cn}"
+KEYS_DIR="$HOME_DIR/keys"
+# ============ 语言 ============
+# 从配置文件读取语言设置，默认中文。英文包在同目录 lang/en.sh
+OCI_CN_LANG="zh"
+[ -f "$HOME_DIR/lang" ] && OCI_CN_LANG=$(head -1 "$HOME_DIR/lang" | tr -d ' \r\n')
+[ "$OCI_CN_LANG" = "en" ] && {
+  _langfile="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/lang/en.sh"
+  [ -f "$_langfile" ] && source "$_langfile"
+}
+# _t: 翻译函数，用法 _t "中文原文" "L_VARIABLE_NAME"
+# 如果英文包已加载且变量存在，返回英文；否则返回中文原文
+_t(){
+  local _fmt="$1" _var="$2"; shift 2
+  if [ "$OCI_CN_LANG" = "en" ] && [ -n "${_var}" ]; then
+    local _val; eval "_val=\"\${$_var}\"" 2>/dev/null
+    [ -n "$_val" ] && _fmt="$_val"
+  fi
+  if [ $# -gt 0 ]; then
+    # shellcheck disable=SC2059
+    printf "$_fmt" "$@"
+  else
+    printf '%s' "$_fmt"
+  fi
+}
+ACC_FILE="$HOME_DIR/accounts.tsv"
+EMAIL_DIR="$HOME_DIR/emails"
+DINGTALK_FILE="$HOME_DIR/dingtalk"
+CF_FILE="$HOME_DIR/cloudflare"
+VERIFY_ENC="$HOME_DIR/verify.enc"
+ATTEMPT_FILE="$HOME_DIR/.attempts"
+MAX_ATTEMPTS=5
+# 时区配置：优先读用户配置，默认 Asia/Shanghai（北京时间）
+# 配置文件：$HOME_DIR/timezone（一行一个 IANA 时区名，如 Asia/Shanghai）
+# 兼容：也从 $HOME_DIR/daily-billing.conf 里找 TIMEZONE=xxx 或 IANA 时区行
+get_tz(){
+  local tzf="$HOME_DIR/timezone" tz=""
+  [ -f "$tzf" ] && tz=$(head -1 "$tzf" 2>/dev/null | tr -d ' \r\n')
+  if [ -z "$tz" ] && [ -f "$HOME_DIR/daily-billing.conf" ]; then
+    tz=$(grep -iE '^TIMEZONE=' "$HOME_DIR/daily-billing.conf" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' \r\n"'"'")
+    [ -z "$tz" ] && tz=$(grep -E '^[A-Za-z_]+/[A-Za-z_+-]+' "$HOME_DIR/daily-billing.conf" 2>/dev/null | head -1 | tr -d ' \r\n')
+  fi
+  if [ -n "$tz" ] && [ -f "/usr/share/zoneinfo/$tz" ]; then
+    printf '%s' "$tz"
+  else
+    printf 'Asia/Shanghai'
+  fi
+}
+# 推送时间戳：用用户配置的时区（默认北京时间 UTC+8）
+bj_time(){ TZ=$(get_tz) date '+%Y-%m-%d %H:%M:%S'; }
+VERIFY_TOKEN="oci-cn-ok"
+RUN_DIR=""
+PASS=""
+
+mkdir -p "$KEYS_DIR" "$EMAIL_DIR"
+command -v oci >/dev/null || { echo "$(_t "未安装 oci-cli，先执行：" "L_NO_OCLICLI")"; echo '  bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)"'; exit 1; }
+command -v openssl >/dev/null || { echo "$(_t "缺少 openssl" "L_NO_OPENSSL")"; exit 1; }
+command -v jq >/dev/null || { echo "$(_t "缺少 jq，请先：apt install -y jq" "L_NO_JQ")"; exit 1; }
+command -v curl >/dev/null || { echo "$(_t "缺少 curl，请先：apt install -y curl" "L_NO_CURL")"; exit 1; }
+
+# ============ 单实例锁：仅交互模式持有 ============
+# CLI 非交互参数（--daily-billing-tick 等）不加锁，避免 cron 被交互会话阻塞
+LOCK="$HOME_DIR/.lock"
+mkdir -p "$HOME_DIR"
+case "$1" in
+  --*) ;;
+  *)
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+      echo "$(_t "已有一个 oci-cn 正在运行，不能重复打开。" "L_ALREADY_RUNNING")"
+      echo "$(_t "若确认没有在用，执行清理：sudo pkill -f oci-cn 后重试。" "L_CLEANUP_HINT")"
+      exit 1
+    fi
+    ;;
+esac
+# 清理上次异常退出残留的解密目录
+find /dev/shm -maxdepth 1 -name 'oci-cn.*' -type d -mmin +1 -exec rm -rf {} + 2>/dev/null
+
+INTR=0
+cleanup(){ [ "$BASHPID" = "$$" ] || return 0; [ -n "$RUN_DIR" ] && rm -rf "$RUN_DIR" 2>/dev/null; PASS=""; flock -u 9 2>/dev/null; }
+on_int(){ INTR=1; echo; echo "（已中断，返回菜单…）"; }
+trap cleanup EXIT TERM
+trap on_int INT
+
+# 提问前清空读取期间误按的按键，只认提示出现后的输入
+_flush_input(){ INTR=0; local _x; while read -r -t 0.05 -n 4096 _x 2>/dev/null; do :; done; }
+_ask(){ _flush_input; read "$@"; }
+# 带取消的输入：_askc "提示" 变量名 [默认值]，输 0 取消并返回1
+_askc(){
+  _flush_input
+  local _prompt="$1" _var="$2" _def="$3" _input
+  if [ -n "$_def" ]; then read -rp "${_prompt}（默认${_def}，回车用默认，输 0 取消）: " _input; _input="${_input:-$_def}"
+  else read -rp "${_prompt}（输 0 取消）: " _input; fi
+  if [ "$_input" = "0" ]; then echo "$(_t "已取消" "L_CANCELLED")"; return 1; fi
+  printf -v "$_var" '%s' "$_input"
+  return 0
+}
+pause(){ _ask -rp "回车继续..." _; }
+line(){ printf '%.0s─' {1..56}; echo; }
+
+# ============ 钉钉推送 ============
+# URL编码（用于加签sign）
+_urlencode(){ local s="$1" o="" c i; for ((i=0;i<${#s};i++)); do c="${s:$i:1}"; case "$c" in [a-zA-Z0-9.~_-]) o+="$c";; *) o+=$(printf '%%%02X' "'$c");; esac; done; echo "$o"; }
+# 推送 markdown 到钉钉。$1=标题 $2=正文(markdown)
+dingtalk_push(){
+  [ -f "$DINGTALK_FILE" ] || return 0   # 未配置则静默跳过
+  local webhook secret
+  webhook=$(sed -n '1p' "$DINGTALK_FILE")
+  secret=$(sed -n '2p' "$DINGTALK_FILE")
+  [ -z "$webhook" ] && return 0
+  local url="$webhook"
+  if [ -n "$secret" ]; then
+    local ts sign
+    ts=$(date +%s%3N)
+    sign=$(printf '%s\n%s' "$ts" "$secret" | openssl dgst -sha256 -hmac "$secret" -binary | base64)
+    url="${webhook}&timestamp=${ts}&sign=$(_urlencode "$sign")"
+  fi
+  local body; body=$(jq -nc --arg t "$1" --arg c "$2" '{msgtype:"markdown",markdown:{title:$t,text:$c}}')
+  # 返回钉钉 API 真实结果（errcode=0 才算成功），调用方可据此判断
+  local resp; resp=$(curl -s -m 10 -X POST -H 'Content-Type: application/json' -d "$body" "$url" 2>/dev/null)
+  [ -n "$resp" ] && echo "$resp" | grep -q '"errcode":0'
+}
+# 换IP后：把指定域名下指向旧IP的 DNS 记录改成新IP。$1=旧IP $2=新IP
+# 记录类型从配置文件读取（默认 A，可配 AAAA 或 A,AAAA）
+cf_update_ip(){
+  [ -f "$CF_FILE" ] || return 0   # 未配置则跳过
+  local token zone; token=$(sed -n '1p' "$CF_FILE"); zone=$(sed -n '2p' "$CF_FILE")
+  local rectypes; rectypes=$(sed -n '3p' "$CF_FILE"); [ -z "$rectypes" ] && rectypes="A"
+  [ -z "$token" ] || [ -z "$zone" ] && return 0
+  local oldip="$1" newip="$2"
+  [ -z "$oldip" ] || [ "$oldip" = null ] && return 0
+  local api="https://api.cloudflare.com/client/v4/zones/$zone/dns_records"
+  local updated="" failed="" nok=0 nfail=0
+  # 按配置的记录类型逐个处理（逗号分隔，如 A,AAAA）
+  local _rt; IFS=',' read -ra _RTS <<< "$rectypes"
+  for _rt in "${_RTS[@]}"; do
+    _rt=$(echo "$_rt" | tr -d ' ' | tr 'a-z' 'A-Z')
+    [ -z "$_rt" ] && continue
+    # 查所有指向旧IP的该类型记录
+    local recs; recs=$(curl -s -m 15 -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+      "$api?type=$_rt&content=$oldip&per_page=100" 2>/dev/null | jq -r '.result[]?|[.id,.name]|@tsv' 2>/dev/null)
+    [ -z "$recs" ] && { echo "$(_t "  CF：没有指向 %s 的 %s 记录" "L_CF_NO_RECS" "$oldip" "$_rt")"; continue; }
+    while IFS=$'\t' read -r rid rname; do
+      [ -z "$rid" ] && continue
+      local ok; ok=$(curl -s -m 15 -X PATCH -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+        --data "{\"content\":\"$newip\"}" "$api/$rid" 2>/dev/null | jq -r '.success' 2>/dev/null)
+      if [ "$ok" = true ]; then echo "  CF：[$_rt] $rname → $newip"; updated="${updated}${rname} "; nok=$((nok+1))
+      else echo "$(_t "  CF：[%s] %s 更新失败" "L_CF_UPDATE_FAIL" "$_rt" "$rname")"; failed="${failed}${rname} "; nfail=$((nfail+1)); fi
+    done <<< "$recs"
+  done
+  [ -n "$updated" ] && notify "CF-DNS更新" "$SEL_NAME" "旧IP：$oldip" "新IP：$newip" "域名：$updated" "状态：已更新 ${nok} 条"
+  [ -n "$failed" ] && notify "CF-DNS更新失败" "$SEL_NAME" "新IP：$newip" "失败域名：$failed" "状态：${nfail} 条未更新，需手动修改"
+}
+# 操作 -> 图标
+_op_icon(){
+  case "$1" in
+    换IP) echo "🎉";; 开机) echo "▶️";; 关机) echo "⏸️";; 强制关机) echo "⏹️";;
+    重启) echo "🔄";; 改配置) echo "⚙️";; 创建) echo "🆕";; 删除) echo "🗑️";;
+    改名) echo "✏️";; 附IPv6) echo "🌐";; 开放端口) echo "🔓";; 关闭端口) echo "🔒";;
+    放行全部) echo "⚠️";; 测试) echo "🔔";;
+    引导卷) echo "💽";; 引导卷扩容) echo "💾";; 引导卷性能) echo "⚡";;
+    流量统计) echo "📊";; 配额查询) echo "📈";; 端口规则|查看端口规则) echo "📋";;
+    串行控制台) echo "🖥️";; 订阅新区域) echo "🌏";; CF-DNS更新) echo "🌍";;
+    账单查询|本月账单) echo "💰";;
+    *) echo "📢";;
+  esac
+}
+# 组装并推送。$1=操作(用于选图标和标题) $2=实例名 $3...=额外"字段:值"行（可选）
+notify(){
+  [ "$INTR" = 1 ] && { INTR=0; _flush_input; echo "已中断，未推送"; return 0; }
+  local op="$1" inst="$2"; shift 2
+  local fail=0; [[ "$op" == *失败* ]] && fail=1
+  local base="${op%失败}"; base="${base%成功}"
+  local icon; if [ "$fail" = 1 ]; then icon="❌"; else icon=$(_op_icon "$base"); fi
+  local ts; ts=$(bj_time)
+  # 仿 Y探长：无 markdown 标题，emoji+操作名一行；字段之间空行（markdown 空行才换行）
+  local md="${icon} ${op}
+
+账号：${ACC_NAME:-—}
+
+区域：${OCI_REGION:-—}
+
+实例：${inst:-—}"
+  local line
+  for line in "$@"; do md="${md}
+
+${line}"; done
+  md="${md}
+
+时间：${ts}"
+  dingtalk_push "$op" "$md"
+}
+
+# ============ 区域中文名 ============
+region_cn(){
+  case "$1" in
+    ap-osaka-1) echo "$(_t "日本大阪" "L_R_OSAKA")";; ap-tokyo-1) echo "$(_t "日本东京" "L_R_TOKYO")";;
+    ap-seoul-1) echo "$(_t "韩国首尔" "L_R_SEOUL")";; ap-chuncheon-1) echo "$(_t "韩国春川" "L_R_CHUNCHEON")";;
+    ap-singapore-1) echo "$(_t "新加坡" "L_R_SG")";; ap-singapore-2) echo "$(_t "新加坡西" "L_R_SG_WEST")";;
+    ap-mumbai-1) echo "$(_t "印度孟买" "L_R_MUMBAI")";; ap-hyderabad-1) echo "$(_t "印度海得拉巴" "L_R_HYDERABAD")";;
+    ap-sydney-1) echo "$(_t "澳洲悉尼" "L_R_SYDNEY")";; ap-melbourne-1) echo "$(_t "澳洲墨尔本" "L_R_MELBOURNE")";;
+    ap-hongkong-1) echo "$(_t "中国香港" "L_R_HK")";; ap-dcc-canberra-1) echo "$(_t "澳洲堪培拉" "L_R_CANBERRA")";;
+    uk-london-1) echo "$(_t "英国伦敦" "L_R_LONDON")";; uk-cardiff-1) echo "$(_t "英国加迪夫" "L_R_CARDIFF")";;
+    eu-frankfurt-1) echo "$(_t "德国法兰克福" "L_R_FRANKFURT")";; eu-amsterdam-1) echo "$(_t "荷兰阿姆斯特丹" "L_R_AMSTERDAM")";;
+    eu-zurich-1) echo "$(_t "瑞士苏黎世" "L_R_ZURICH")";; eu-milan-1) echo "$(_t "意大利米兰" "L_R_MILAN")";;
+    eu-paris-1) echo "$(_t "法国巴黎" "L_R_PARIS")";; eu-marseille-1) echo "$(_t "法国马赛" "L_R_MARSEILLE")";;
+    eu-stockholm-1) echo "$(_t "瑞典斯德哥尔摩" "L_R_STOCKHOLM")";; eu-madrid-1) echo "$(_t "西班牙马德里" "L_R_MADRID")";;
+    us-ashburn-1) echo "$(_t "美国阿什本" "L_R_ASHBURN")";; us-phoenix-1) echo "$(_t "美国凤凰城" "L_R_PHOENIX")";;
+    us-sanjose-1) echo "$(_t "美国圣何塞" "L_R_SANJOSE")";; us-chicago-1) echo "$(_t "美国芝加哥" "L_R_CHICAGO")";;
+    ca-toronto-1) echo "$(_t "加拿大多伦多" "L_R_TORONTO")";; ca-montreal-1) echo "$(_t "加拿大蒙特利尔" "L_R_MONTREAL")";;
+    me-dubai-1) echo "$(_t "阿联酋迪拜" "L_R_DUBAI")";; me-abudhabi-1) echo "$(_t "阿联酋阿布扎比" "L_R_ABUDHABI")";;
+    me-jeddah-1) echo "$(_t "沙特吉达" "L_R_JEDDAH")";; me-riyadh-1) echo "$(_t "沙特利雅得" "L_R_RIYADH")";;
+    sa-saopaulo-1) echo "$(_t "巴西圣保罗" "L_R_SAOPAULO")";; sa-vinhedo-1) echo "$(_t "巴西维涅杜" "L_R_VINHEDO")";;
+    sa-santiago-1) echo "$(_t "智利圣地亚哥" "L_R_SANTIAGO")";; sa-valparaiso-1) echo "$(_t "智利瓦尔帕莱索" "L_R_VALPARAISO")";;
+    sa-bogota-1) echo "$(_t "哥伦比亚波哥大" "L_R_BOGOTA")";;
+    af-johannesburg-1) echo "$(_t "南非约翰内斯堡" "L_R_JOHANNESBURG")";; af-casablanca-1) echo "$(_t "摩洛哥卡萨布兰卡" "L_R_CASABLANCA")";;
+    il-jerusalem-1) echo "$(_t "以色列耶路撒冷" "L_R_JERUSALEM")";;
+    ap-batam-1) echo "$(_t "印尼巴淡" "L_R_BATAM")";; ap-kulai-2) echo "$(_t "马来西亚古来" "L_R_KULAI")";;
+    mx-monterrey-1) echo "$(_t "墨西哥蒙特雷" "L_R_MONTERREY")";; mx-queretaro-1) echo "$(_t "墨西哥克雷塔罗" "L_R_QUERETARO")";;
+    eu-turin-1) echo "$(_t "意大利都灵" "L_R_TURIN")";; eu-madrid-3) echo "$(_t "西班牙马德里3" "L_R_MADRID3")";;
+    *) echo "$1";;
+  esac
+}
+
+# 从账号中文名猜主区域（helper 里名字就带地名），命中则验证秒过
+name_to_region(){
+  case "$1" in
+    *大阪*) echo "ap-osaka-1";; *东京*) echo "ap-tokyo-1";;
+    *首尔*) echo "ap-seoul-1";; *春川*) echo "ap-chuncheon-1";;
+    *新加坡西*|*新加坡2*) echo "ap-singapore-2";; *新加坡*) echo "ap-singapore-1";; *孟买*) echo "ap-mumbai-1";;
+    *海得拉巴*|*印度*) echo "ap-hyderabad-1";;
+    *伦敦*|*英国*) echo "uk-london-1";;
+    *法兰克福*) echo "eu-frankfurt-1";; *巴黎*|*法国*) echo "eu-paris-1";;
+    *阿姆斯特丹*|*荷兰*) echo "eu-amsterdam-1";;
+    *凤凰城*) echo "us-phoenix-1";; *圣何塞*|*圣荷西*) echo "us-sanjose-1";;
+    *阿什本*|*美东*) echo "us-ashburn-1";;
+    *多伦多*|*蒙特利尔*|*加拿大*) echo "ca-toronto-1";;
+    *圣保罗*|*巴西*) echo "sa-saopaulo-1";;
+    *) echo "";;
+  esac
+}
+
+# ============ 密码（输错达上限删除所有加密密钥和账号配置） ============
+unlock(){
+  [ -f "$HOME_DIR/.nopass" ] && { PASS=""; return 0; }
+  if [ ! -f "$VERIFY_ENC" ]; then
+    echo "$(_t "首次使用，设置解密密码（加密所有 API 私钥）" "L_SET_PASSWD")"
+    local p1 p2
+    _ask -rsp "设置密码: " p1; echo
+    _ask -rsp "再输一次: " p2; echo
+    [ "$p1" != "$p2" ] && { echo "$(_t "两次不一致" "L_PASSWD_MISMATCH")"; exit 1; }
+    [ -z "$p1" ] && { echo "$(_t "密码不能为空" "L_PASSWD_EMPTY")"; exit 1; }
+    PASS="$p1"
+    printf '%s' "$VERIFY_TOKEN" | OCN_PW="$PASS" openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:OCN_PW -out "$VERIFY_ENC" 2>/dev/null
+    echo "0" > "$ATTEMPT_FILE"; echo "$(_t "密码已设置。" "L_PASSWD_SET")"; return 0
+  fi
+  local att; att=$(cat "$ATTEMPT_FILE" 2>/dev/null || echo 0)
+  # PASS 预设（--password / OCI_CN_PASS）视为非交互，只试一次；交互式输错可无限重试，永不删除文件
+  local preset=0; [ -n "$PASS" ] && preset=1
+  while true; do
+    if [ -z "$PASS" ]; then
+      [ -t 0 ] || { echo "$(_t "密码错误" "L_PASSWD_WRONG_ONCE")"; exit 1; }
+      _ask -rsp "$(_t "解密密码: " "L_ASK_PASSWD")" PASS || { echo; exit 1; }
+      echo
+    fi
+    local got; got=$(OCN_PW="$PASS" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:OCN_PW -in "$VERIFY_ENC" 2>/dev/null)
+    if [ "$got" = "$VERIFY_TOKEN" ]; then echo "0" > "$ATTEMPT_FILE"; return 0; fi
+    att=$((att+1)); echo "$att" > "$ATTEMPT_FILE"
+    [ "$preset" = "1" ] && { echo "$(_t "密码错误" "L_PASSWD_WRONG_ONCE")"; exit 1; }
+    echo "$(_t "密码错误，请重试。" "L_PASSWD_RETRY")"
+    PASS=""
+  done
+}
+enc_key(){ OCN_PW="$PASS" openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:OCN_PW -in "$1" -out "$2" 2>/dev/null; }
+dec_key(){ OCN_PW="$PASS" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:OCN_PW -in "$1" -out "$2" 2>/dev/null; }
+
+# ============ 解密到 /dev/shm ============
+prepare_runtime(){
+  [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && return 0
+  RUN_DIR=$(mktemp -d /dev/shm/oci-cn.XXXXXX) || { echo "/dev/shm 不可用"; exit 1; }
+  chmod 700 "$RUN_DIR"
+  [ -f "$ACC_FILE" ] || return 0
+  while IFS=$'\t' read -r name _t _u _f _h _tn _pl _st; do
+    [ -z "$name" ] && continue
+    if [ -f "$HOME_DIR/.nopass" ] && [ -f "$KEYS_DIR/$name.pem" ]; then
+      cp "$KEYS_DIR/$name.pem" "$RUN_DIR/$name.pem"; chmod 600 "$RUN_DIR/$name.pem";
+    elif [ -f "$KEYS_DIR/$name.pem.enc" ]; then
+      dec_key "$KEYS_DIR/$name.pem.enc" "$RUN_DIR/$name.pem"; chmod 600 "$RUN_DIR/$name.pem";
+    fi
+  done < "$ACC_FILE"
+}
+
+oci_cfg(){  # $1=name $2=region -> 回显配置文件路径
+  local name="$1" region="$2" cfg="$RUN_DIR/$1.config"
+  local tenancy user fp
+  IFS=$'\t' read -r _n tenancy user fp _rest < <(awk -F'\t' -v n="$name" '$1==n' "$ACC_FILE")
+  cat > "$cfg" <<EOF
+[DEFAULT]
+user=$user
+fingerprint=$fp
+tenancy=$tenancy
+region=$region
+key_file=$RUN_DIR/$name.pem
+EOF
+  chmod 600 "$cfg"; echo "$cfg"
+}
+o(){ oci --config-file "$OCI_CFG" --region "$OCI_REGION" "$@"; }
+
+# ============ 账号读取 ============
+list_accounts(){
+  [ -s "$ACC_FILE" ] || { echo "（无账号，先到系统配置添加或导入）"; return 1; }
+  echo "编号  账号名          套餐     状态     租户"
+  local i=0
+  while IFS=$'\t' read -r name t u f home tname plan status; do
+    [ -z "$name" ] && continue; i=$((i+1))
+    printf "%-4s  %-14s %-8s %-8s %s\n" "$i" "$name" "${plan:-—}" "${status:-—}" "${tname:-—}"
+  done < "$ACC_FILE"
+}
+get_account_by_index(){ awk -v n="$1" 'NF{c++; if(c==n){print; exit}}' "$ACC_FILE"; }
+
+# ============ 导入 oci-helper ============
+import_from_helper(){
+  local db="$1"; local keydir; keydir=$(dirname "$db")/keys
+  command -v sqlite3 >/dev/null || { echo "缺少 sqlite3：apt install -y sqlite3"; return 1; }
+  [ -f "$db" ] || { echo "找不到 $db"; return 1; }
+  echo "读取账号（按租户合并，区域忽略）..."
+  local rows; rows=$(sqlite3 -separator $'\t' "$db" \
+    "select username, oci_tenant_id, oci_user_id, oci_fingerprint, oci_key_path, coalesce(tenant_name,''), coalesce(plan_type,''), coalesce(account_status,'') from oci_user group by oci_tenant_id;")
+  [ -z "$rows" ] && { echo "$(_t "无数据" "L_NO_DATA")"; return 1; }
+  local n=0
+  while IFS=$'\t' read -r username tenancy user fp keypath tname plan status; do
+    [ -z "$username" ] && continue
+    local src="$keypath"; [ -f "$src" ] || src="$keydir/$(basename "$keypath")"
+    [ -f "$src" ] || { echo "  跳过 $username：找不到密钥"; continue; }
+    local aname="$username" k=1
+    while awk -F'\t' -v n="$aname" '$1==n{found=1; exit} END{exit !found}' "$ACC_FILE" 2>/dev/null; do aname="${username}_$k"; k=$((k+1)); done
+    enc_key "$src" "$KEYS_DIR/$aname.pem.enc"
+    dec_key "$KEYS_DIR/$aname.pem.enc" "$RUN_DIR/$aname.pem" 2>/dev/null; chmod 600 "$RUN_DIR/$aname.pem" 2>/dev/null
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$aname" "$tenancy" "$user" "$fp" "-" "${tname:--}" "${plan:--}" "${status:--}" >> "$ACC_FILE"
+    n=$((n+1)); echo "$(_t "  导入 %s" "L_IMPORT_X" "$aname")"
+  done <<< "$rows"
+  echo "$(_t "共导入 %s 个。逐个验证..." "L_IMPORTED_N" "$n")"; verify_all
+  echo; echo "$(_t "全部 ✓ 后再删除 oci-helper：" "L_DEL_HELPER_HINT")"
+  echo "  docker rm -f oci-helper oci-helper-watcher websockify 2>/dev/null; rm -rf /app/oci-helper"
+}
+
+verify_all(){
+  local ok=0 bad=0
+  export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+  while IFS=$'\t' read -r name tenancy user fp home tname plan status; do
+    [ -z "$name" ] && continue
+    [ "$home" = - ] && home=""
+    # 模式：missing=只处理信息不完整的；only:名字=只验证该账号；空=全部
+    case "$1" in
+      missing) if [ -n "$home" ] && [ -n "$tname" ] && [ "$tname" != - ] && [[ "$plan" =~ ^(FREE_TIER|PAYG)$ ]] && [ "$status" = ACTIVE ]; then
+                 echo "$(_t "  · %s 信息完整，跳过" "L_SKIP_COMPLETE" "$name")"; ok=$((ok+1)); continue; fi;;
+      only:*) [ "$name" = "${1#only:}" ] || continue;;
+    esac
+    local hr="" guess; guess=$(name_to_region "$name")
+    # 第一步：优先用保存的主区域（添加时从配置解析的 region）
+    if [ -n "$home" ]; then
+      OCI_CFG=$(oci_cfg "$name" "$home")
+      hr=$(oci --config-file "$OCI_CFG" --region "$home" iam region-subscription list --tenancy-id "$tenancy" \
+           --query 'data[?"is-home-region"]."region-name"|[0]' --raw-output 2>/dev/null)
+      [ "$hr" = null ] && hr=""
+    fi
+    # 第二步：名字猜的区域
+    if [ -z "$hr" ] && [ -n "$guess" ]; then
+      OCI_CFG=$(oci_cfg "$name" "$guess")
+      hr=$(oci --config-file "$OCI_CFG" --region "$guess" iam region-subscription list --tenancy-id "$tenancy" \
+           --query 'data[?"is-home-region"]."region-name"|[0]' --raw-output 2>/dev/null)
+      [ "$hr" = null ] && hr=""
+    fi
+    # 第三步：轮询兜底（全区域）
+    if [ -z "$hr" ]; then
+      for r in ap-tokyo-1 ap-osaka-1 ap-seoul-1 ap-chuncheon-1 ap-singapore-1 ap-singapore-2 \
+               ap-mumbai-1 ap-hyderabad-1 ap-sydney-1 ap-melbourne-1 ap-hongkong-1 ap-kulai-2 ap-batam-1 \
+               us-ashburn-1 us-phoenix-1 us-sanjose-1 us-chicago-1 ca-toronto-1 ca-montreal-1 \
+               uk-london-1 uk-cardiff-1 eu-frankfurt-1 eu-amsterdam-1 eu-zurich-1 eu-milan-1 \
+               eu-paris-1 eu-marseille-1 eu-stockholm-1 eu-madrid-1 eu-madrid-3 eu-turin-1 \
+               me-dubai-1 me-abudhabi-1 me-jeddah-1 me-riyadh-1 \
+               sa-saopaulo-1 sa-santiago-1 sa-vinhedo-1 sa-valparaiso-1 sa-bogota-1 \
+               af-johannesburg-1 af-casablanca-1 il-jerusalem-1 mx-monterrey-1 mx-queretaro-1; do
+        [ "$INTR" = 1 ] && { INTR=0; break; }
+        [ -z "$r" ] || [ "$r" = "$guess" ] || [ "$r" = "$home" ] && continue
+        OCI_CFG=$(oci_cfg "$name" "$r")
+        hr=$(oci --config-file "$OCI_CFG" --region "$r" iam region-subscription list --tenancy-id "$tenancy" \
+             --query 'data[?"is-home-region"]."region-name"|[0]' --raw-output 2>/dev/null)
+        [ -n "$hr" ] && [ "$hr" != null ] && break
+        hr=""
+      done
+    fi
+    if [ -n "$hr" ]; then
+      ok=$((ok+1)); echo "  ✓ $name（主区域 $hr $(region_cn "$hr")）"
+      awk -F'\t' -v OFS='\t' -v n="$name" -v h="$hr" '$1==n{$5=h}1' "$ACC_FILE" > "$ACC_FILE.tmp" && mv "$ACC_FILE.tmp" "$ACC_FILE"
+      # 租户名/套餐/状态：不完整时在主区域查询补全（空值存为 - ，避免 tab 分隔错位）
+      if [ -z "$tname" ] || [ "$tname" = - ] || ! [[ "$plan" =~ ^(FREE_TIER|PAYG)$ ]] || [ "$status" != ACTIVE ]; then
+        OCI_CFG=$(oci_cfg "$name" "$hr")
+        local tn pl perr
+        tn=$(oci --config-file "$OCI_CFG" --region "$hr" iam tenancy get --tenancy-id "$tenancy" --query 'data.name' --raw-output 2>/dev/null)
+        [ -z "$tn" ] || [ "$tn" = null ] && tn="${tname:--}"
+        [[ "$plan" =~ ^(FREE_TIER|PAYG)$ ]] && pl="$plan" || {
+          perr=$(oci --config-file "$OCI_CFG" --region "$hr" osp-gateway subscription-service subscription list --compartment-id "$tenancy" --osp-home-region "$hr" \
+                 --query 'data.items[0]."plan-type" || data[0]."plan-type"' --raw-output 2>&1)
+          pl=$(echo "$perr" | grep -m1 -xE 'FREE_TIER|PAYG'); [ -z "$pl" ] && pl="-"
+        }
+        awk -F'\t' -v OFS='\t' -v n="$name" -v a="$tn" -v b="$pl" '$1==n{$6=a;$7=b;$8="ACTIVE"}1' "$ACC_FILE" > "$ACC_FILE.tmp" && mv "$ACC_FILE.tmp" "$ACC_FILE"
+        if [ "$pl" = - ]; then echo "      租户：$tn  套餐：未知（查询失败：$(_oci_err "$perr")）"
+        else echo "      租户：$tn  套餐：$pl"; fi
+      fi
+    else
+      bad=$((bad+1)); echo "$(_t "  ✗ %s 调用失败（密钥或权限问题）" "L_CALL_FAIL" "$name")"
+    fi
+  done < "$ACC_FILE"
+  echo "$(_t "可用 %s 个，失败 %s 个。" "L_AVAIL_X" "$ok" "$bad")"
+}
+
+# 租户可用性验证：每个账号实测一次 API；通→ACTIVE，不通→INVALID。$1=quiet 时只输出汇总
+verify_usability(){
+  local quiet=0; [ "$1" = quiet ] && quiet=1
+  local ok=0 bad=0 bad_names=""
+  export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+  while IFS=$'\t' read -r name tenancy user fp home tname plan status; do
+    [ -z "$name" ] && continue
+    local r="$home"; [ "$r" = - ] && r=""; [ -z "$r" ] && r=$(name_to_region "$name")
+    local good=0 try
+    for try in "$r" "$(name_to_region "$name")"; do
+      [ -z "$try" ] && continue
+      local cfg; cfg=$(oci_cfg "$name" "$try")
+      local out
+      out=$(timeout 30 oci --config-file "$cfg" --region "$try" iam region-subscription list --tenancy-id "$tenancy" \
+        --query 'data[?"is-home-region"]."region-name"|[0]' --raw-output 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$out" ] && [ "$out" != null ]; then good=1; break; fi
+    done
+    if [ "$good" = 1 ]; then
+      ok=$((ok+1)); [ "$quiet" = 0 ] && echo "  ✓ $name 可用"
+      awk -F'\t' -v OFS='\t' -v n="$name" '$1==n{$8="ACTIVE"}1' "$ACC_FILE" > "$ACC_FILE.tmp" && mv "$ACC_FILE.tmp" "$ACC_FILE"
+    else
+      bad=$((bad+1)); [ "$quiet" = 0 ] && echo "  ✗ $name 不可用，已标 INVALID"
+      bad_names="${bad_names}${name} "
+    fi
+  done < "$ACC_FILE"
+  if [ "$quiet" = 1 ] && [ "$ok" = 0 ] && [ "$bad" -gt 0 ]; then
+    echo "$(_t "租户验证：全部失败，疑似网络问题，未修改状态。" "L_TENANT_NET")"
+  else
+    local n
+    for n in $bad_names; do
+      awk -F'\t' -v OFS='\t' -v n="$n" '$1==n{$8="INVALID"}1' "$ACC_FILE" > "$ACC_FILE.tmp" && mv "$ACC_FILE.tmp" "$ACC_FILE"
+    done
+    echo "$(_t "租户验证：可用 %s 个，失效 %s 个。" "L_TENANT_CHECK" "$ok" "$bad")"
+  fi
+}
+
+add_account(){
+  local name tenancy user fp keyfile
+  echo "$(_t "添加账号，方式：" "L_ADD_ACCT_WAY")"
+  echo "$(_t " 1 粘贴配置+粘贴私钥（推荐）" "L_ADD_WAY1")"
+  echo "$(_t " 2 逐项输入+私钥文件路径" "L_ADD_WAY2")"
+  _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" way
+  _ask -rp "账号名（建议带地名，如 美国阿什本）: " name; [ -z "$name" ] && return
+  [[ "$name" == *"/"* ]] && { echo "$(_t "账号名不能含 /" "L_NAME_NO_SLASH")"; return; }
+  awk -F'\t' -v n="$name" '$1==n{found=1; exit} END{exit !found}' "$ACC_FILE" 2>/dev/null && { echo "$(_t "已存在同名账号" "L_DUP_ACCT")"; return; }
+
+  if [ "$way" = 1 ]; then
+    echo "$(_t "粘贴控制台的 [DEFAULT] 配置段，粘完另起一行输入 END 回车：" "L_PASTE_CONFIG")"
+    local cfgtext="" ln
+    while IFS= read -r ln; do [ "$ln" = "END" ] && break; cfgtext+="$ln"$'\n'; done
+    [ "$INTR" = 1 ] && { INTR=0; echo "已取消"; return; }
+    tenancy=$(echo "$cfgtext" | grep -iE '^tenancy' | head -1 | cut -d= -f2- | tr -d ' \r')
+    user=$(echo "$cfgtext" | grep -iE '^user' | head -1 | cut -d= -f2- | tr -d ' \r')
+    fp=$(echo "$cfgtext" | grep -iE '^fingerprint' | head -1 | cut -d= -f2- | tr -d ' \r')
+    local cfgregion; cfgregion=$(echo "$cfgtext" | grep -iE '^region' | head -1 | cut -d= -f2- | tr -d ' \r')
+    [ -z "$tenancy" ] || [ -z "$user" ] || [ -z "$fp" ] && { echo "$(_t "配置解析失败，缺 tenancy/user/fingerprint" "L_CONFIG_PARSE_FAIL")"; return; }
+    echo "已解析：tenancy=${tenancy: -8}  user=${user: -8}  fp=$fp"
+    echo "$(_t "粘贴私钥（含 BEGIN/END 两行整段），粘完另起一行输入 END 回车：" "L_PASTE_KEY")"
+    local keytext="" kl
+    while IFS= read -r kl; do [ "$kl" = "END" ] && break; keytext+="$kl"$'\n'; done
+    [ "$INTR" = 1 ] && { INTR=0; echo "已取消"; return; }
+    echo "$keytext" | grep -q "BEGIN" || { echo "$(_t "不是有效私钥（缺 BEGIN 行）" "L_INVALID_KEY")"; return; }
+    # 明文私钥直接加密，不落地
+    printf '%s' "$keytext" | OCN_PW="$PASS" openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:OCN_PW -out "$KEYS_DIR/$name.pem.enc" 2>/dev/null
+  else
+    _askc "$(_t "租户 OCID" "L_TENANCY_OCID")" tenancy || return
+    _askc "$(_t "用户 OCID" "L_USER_OCID")" user || return
+    _askc "$(_t "指纹" "L_FINGERPRINT")" fp || return
+    _askc "$(_t "主区域（如 ap-kulai-2，可留空）" "L_MAIN_REGION")" cfgregion || return
+    _askc "$(_t "私钥 pem 路径" "L_KEY_PATH")" keyfile || return
+    [ -f "$keyfile" ] || { echo "$(_t "密钥文件不存在" "L_KEY_NOT_FOUND")"; return; }
+    enc_key "$keyfile" "$KEYS_DIR/$name.pem.enc"
+  fi
+
+  dec_key "$KEYS_DIR/$name.pem.enc" "$RUN_DIR/$name.pem" 2>/dev/null; chmod 600 "$RUN_DIR/$name.pem" 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$tenancy" "$user" "$fp" "${cfgregion:--}" "-" "-" "-" >> "$ACC_FILE"
+  echo "$(_t "验证中..." "L_VERIFYING")"; verify_all "only:$name"
+}
+del_account(){
+  list_accounts || return
+  _askc "$(_t "删除编号" "L_DEL_NUM")" idx || return
+  local row; row=$(get_account_by_index "$idx"); [ -z "$row" ] && { echo "无效"; return; }
+  local name; name=$(echo "$row" | cut -f1)
+  _ask -rp "$(_t "确认删除 %s 及密钥？(yes/n): " "L_ASK_DEL_ACCT" "$name")" c; [ "$c" != yes ] && return
+  awk -F'\t' -v n="$name" '$1!=n' "$ACC_FILE" > "$ACC_FILE.tmp" && mv "$ACC_FILE.tmp" "$ACC_FILE"
+  rm -f "$KEYS_DIR/$name.pem.enc" "$RUN_DIR/$name.pem"; echo "$(_t "已删除。" "L_DELETED")"
+}
+
+# ============ 区域选择 ============
+choose_region(){  # $1=name $2=tenancy $3=home
+  local name="$1" tenancy="$2" home="$3"
+  export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+  local regions="" guess; guess=$(name_to_region "$name")
+  for r in "$guess" "$home" ap-osaka-1 ap-tokyo-1 ap-seoul-1 ap-chuncheon-1 ap-singapore-1 ap-singapore-2 \
+           us-ashburn-1 us-phoenix-1 us-sanjose-1 uk-london-1 eu-frankfurt-1 \
+           eu-paris-1 eu-amsterdam-1 ap-mumbai-1 ap-hyderabad-1 ca-toronto-1 sa-saopaulo-1; do
+    [ "$INTR" = 1 ] && { INTR=0; break; }
+    [ -z "$r" ] && continue
+    local tmpcfg; tmpcfg=$(oci_cfg "$name" "$r")
+    regions=$(oci --config-file "$tmpcfg" --region "$r" iam region-subscription list --tenancy-id "$tenancy" \
+      --query 'data[].["region-name","is-home-region"]' 2>/dev/null | jq -r '.[]|@tsv')
+    [ -n "$regions" ] && break
+  done
+  [ -z "$regions" ] && { echo "读取区域失败（所有区域认证均未通过，检查密钥或网络）"; return 1; }
+  echo "$(_t "已订阅区域（扫描实例中…）：" "L_SUB_REGIONS")"; REG_ARR=(); local i=0
+  while IFS=$'\t' read -r rn ishome; do
+    [ "$INTR" = 1 ] && { INTR=0; break; }
+    [ -z "$rn" ] && continue; i=$((i+1)); REG_ARR[$i]="$rn"
+    local mark=""; [ "$ishome" = "true" ] && mark="（主区域）"
+    # 统计该区域运行中的实例数
+    local cfg cnt
+    cfg=$(oci_cfg "$name" "$rn")
+    cnt=$(oci --config-file "$cfg" --region "$rn" compute instance list -c "$tenancy" --all \
+          --query 'length(data[?"lifecycle-state"==`"RUNNING"`])' --raw-output 2>/dev/null)
+    local busy=""; [ -n "$cnt" ] && [ "$cnt" -gt 0 ] 2>/dev/null && busy="  ● 有${cnt}台"
+    printf "  %s  %-18s %s%s%s\n" "$i" "$rn" "$(region_cn "$rn")" "$mark" "$busy"
+  done <<< "$regions"
+  _ask -rp "$(_t "选择区域编号: " "L_ASK_REGION_NUM")" ridx
+  OCI_REGION="${REG_ARR[$ridx]}"; [ -z "$OCI_REGION" ] && { echo "无效"; return 1; }
+  return 0
+}
+
+# ============ 实例 ============
+# 列出实例已挂载（ATTACHED）的块存储卷。$1=实例ID $2=可用域。输出：名称<TAB>大小G<TAB>卷ID
+_inst_data_vols(){
+  local vid
+  for vid in $(o compute volume-attachment list -c "$TENANCY" --availability-domain "$2" --instance-id "$1" --all 2>/dev/null \
+      | jq -r '.data[]? | select(."lifecycle-state"=="ATTACHED") | ."volume-id"' 2>/dev/null); do
+    o bv volume get --volume-id "$vid" 2>/dev/null | jq -r --arg v "$vid" '.data | [."display-name", (."size-in-gbs"|tostring), $v] | @tsv' 2>/dev/null
+  done
+}
+inst_list(){
+  echo "$(_t "读取实例..." "L_READING_INST")"; INST_IDS=(); INST_NAMES=(); INST_ADS=()
+  local data
+  data=$(o compute instance list -c "$TENANCY" --all \
+    --query 'data[?"lifecycle-state"!=`"TERMINATED"`].["display-name","lifecycle-state",shape,id]' 2>/dev/null | jq -r '.[]|@tsv')
+  [ -z "$data" ] && { echo "$(_t "无实例" "L_NO_INST")"; return 1; }
+  echo "编号  名称                   状态      规格/配置                   公网IP           所在子网"
+  local i=0
+  while IFS=$'\t' read -r name state shape id; do
+    [ "$INTR" = 1 ] && { INTR=0; break; }
+    [ -z "$id" ] && continue; i=$((i+1))
+    INST_IDS[$i]="$id"; INST_NAMES[$i]="$name"
+    local pubip sid sname ad ocpu mem disk cfgstr
+    pubip=$(o compute instance list-vnics --instance-id "$id" --query 'data[?"is-primary"]|[0]."public-ip"' --raw-output 2>/dev/null)
+    sid=$(o compute instance list-vnics --instance-id "$id" --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output 2>/dev/null)
+    sname=$(o network subnet get --subnet-id "$sid" --query 'data."display-name"' --raw-output 2>/dev/null)
+    IFS=$'\t' read -r ad ocpu mem < <(o compute instance get --instance-id "$id" \
+      --query 'data.["availability-domain","shape-config".ocpus,"shape-config"."memory-in-gbs"]' 2>/dev/null | jq -r '@tsv')
+    INST_ADS[$i]="$ad"
+    # 引导卷大小
+    disk=$(o compute boot-volume-attachment list -c "$TENANCY" --availability-domain "$ad" --instance-id "$id" \
+      --query 'data[?"lifecycle-state"==`"ATTACHED"`]."boot-volume-id" | [0]' --raw-output 2>/dev/null)
+    [ -n "$disk" ] && disk=$(o bv boot-volume get --boot-volume-id "$disk" --query 'data."size-in-gbs"' --raw-output 2>/dev/null)
+    # 挂载的块存储卷：显示为 引导卷+数据盘，如 200G+50G
+    local dvn dvs dvi extra=""
+    while IFS=$'\t' read -r dvn dvs dvi; do [ -n "$dvs" ] && extra="${extra}+${dvs}G"; done < <(_inst_data_vols "$id" "$ad")
+    # 组合：简化 shape 名 + 核/内存/盘
+    local shortshape="${shape#VM.Standard.}"
+    cfgstr=$(printf "%s %s核/%sG/%sG%s" "$shortshape" "${ocpu%.*}" "${mem%.*}" "${disk:-?}" "$extra")
+    printf "%-4s  %-20s %-9s %-24s %-15s %s\n" "$i" "$name" "$state" "$cfgstr" "${pubip:-—}" "${sname:-—}"
+  done <<< "$data"
+}
+pick_instance(){ inst_list || return 1; local ii; _askc "$(_t "选择实例编号" "L_CHOOSE_INST")" ii || return 1; SEL_ID="${INST_IDS[$ii]}"; SEL_NAME="${INST_NAMES[$ii]}"; SEL_AD="${INST_ADS[$ii]}"; [ -z "$SEL_ID" ] && { echo "无效"; return 1; }; return 0; }
+# ---- 通用辅助 ----
+_is_int(){ [[ "$1" =~ ^[0-9]+$ ]]; }
+_confirm(){ local c; _ask -rp "$1 (y/n): " c; [ "$c" = y ]; }
+_inst_state(){ o compute instance get --instance-id "$1" --query 'data."lifecycle-state"' --raw-output 2>/dev/null; }
+_inst_ip(){ local ip; ip=$(o compute instance list-vnics --instance-id "$1" --query 'data[?"is-primary"]|[0]."public-ip"' --raw-output 2>/dev/null); [ "$ip" = null ] && ip=""; echo "$ip"; }
+# 从 OCI 报错里取出 message 首行
+_oci_err(){ local m; m=$(echo "$1" | grep -m1 '"message"' | sed 's/.*"message": *"//;s/",*$//'); [ -z "$m" ] && m=$(echo "$1" | grep -m1 -i '^Error'); [ -z "$m" ] && m=$(echo "$1" | grep -v '^\s*$' | grep -v 'oci -i' | tail -1); echo "${m:0:150}"; }
+# 轮询实例状态直到目标值。$1=id $2=目标 $3=最长秒数。stdout 输出最终状态
+_wait_state(){
+  local id="$1" want="$2" max="${3:-300}" t=0 st=""
+  while [ "$t" -lt "$max" ]; do
+    [ "$INTR" = 1 ] && { INTR=0; break; }
+    st=$(_inst_state "$id")
+    [ "$st" = "$want" ] && { echo >&2; echo "$st"; return 0; }
+    printf '.' >&2; sleep 10; t=$((t+10))
+  done
+  echo >&2; echo "$st"; return 1
+}
+inst_action(){
+  pick_instance || return
+  local target; case "$1" in START|SOFTRESET|RESET) target=RUNNING;; *) target=STOPPED;; esac
+  local cur; cur=$(_inst_state "$SEL_ID")
+  if [ "$1" != SOFTRESET ] && [ "$1" != RESET ] && [ "$cur" = "$target" ]; then echo "$SEL_NAME 当前已是 $cur，无需操作。"; return; fi
+  _confirm "确认对 $SEL_NAME（当前 $cur）执行「$2」？" || return
+  local out t0=$SECONDS
+  out=$(o compute instance action --instance-id "$SEL_ID" --action "$1" 2>&1) || { echo "失败：$(_oci_err "$out")"; notify "$2失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; return; }
+  echo "$(_t "已发送，等待状态变为 %s（最多5分钟，Ctrl+C 可中断）" "L_WAIT_STATE" "$target")"
+  [ "$1" = SOFTRESET ] || [ "$1" = RESET ] && sleep 20
+  local st ip dt; st=$(_wait_state "$SEL_ID" "$target" 300); ip=$(_inst_ip "$SEL_ID"); dt=$((SECONDS-t0))
+  if [ "$st" = "$target" ]; then
+    echo "$(_t "完成：%s  公网IP：%s  耗时：%s秒" "L_DONE_STATE" "$st" "${ip:-无}" "${dt}")"
+    notify "$2成功" "$SEL_NAME" "状态：$st" "公网IP：${ip:-—}" "耗时：${dt}秒"
+  else
+    echo "未在时限内完成，当前状态：${st:-未知}"
+    notify "$2失败" "$SEL_NAME" "原因：超时未达到 $target" "当前状态：${st:-未知}" "公网IP：${ip:-—}"
+  fi
+}
+inst_change_shape(){
+  pick_instance || return
+  local shp oc0 mm0
+  IFS=$'\t' read -r shp oc0 mm0 < <(o compute instance get --instance-id "$SEL_ID" --query 'data.[shape,"shape-config".ocpus,"shape-config"."memory-in-gbs"]' 2>/dev/null | jq -r '@tsv')
+  [[ "$shp" == *Flex* ]] || { echo "$(_t "%s 不是 Flex 规格，不能改配置。" "L_NOT_FLEX" "$shp")"; return; }
+  echo "$(_t "当前：%s核 / %sG（A1 免费上限：整个账号合计 4核/24G）" "L_CURR_CFG" "${oc0%.*}" "${mm0%.*}")"
+  local ocpu mem; _ask -rp "新 OCPU: " ocpu; _ask -rp "新内存GB: " mem
+  _is_int "$ocpu" && _is_int "$mem" && [ "$ocpu" -ge 1 ] && [ "$mem" -ge 1 ] || { echo "$(_t "输入必须是正整数" "L_MUST_POS_INT")"; return; }
+  if [ "$ocpu" -gt 4 ] || [ "$mem" -gt 24 ]; then _ask -rp "$(_t "⚠️ 超出免费额度会产生费用，确认请输 yes: " "L_ASK_OVER_FREE")" c; [ "$c" = yes ] || return; fi
+  _confirm "确认 $SEL_NAME：${oc0%.*}核/${mm0%.*}G → ${ocpu}核/${mem}G？（会重启一次）" || return
+  local out t0=$SECONDS
+  out=$(o compute instance update --instance-id "$SEL_ID" --shape-config "{\"ocpus\":$ocpu,\"memoryInGBs\":$mem}" --force 2>&1) || { echo "失败：$(_oci_err "$out")"; notify "改配置失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; return; }
+  echo "$(_t "已提交，等待实例重启完成（最多5分钟）" "L_WAIT_REBOOT")"; sleep 20
+  local st ip oc1 mm1; st=$(_wait_state "$SEL_ID" RUNNING 300); ip=$(_inst_ip "$SEL_ID")
+  IFS=$'\t' read -r oc1 mm1 < <(o compute instance get --instance-id "$SEL_ID" --query 'data.["shape-config".ocpus,"shape-config"."memory-in-gbs"]' 2>/dev/null | jq -r '@tsv')
+  if [ "$st" = RUNNING ]; then
+    echo "$(_t "完成：%s核/%sG  公网IP：%s  耗时：%s" "L_RESIZE_DONE" "${oc1%.*}" "${mm1%.*}" "${ip:-无}" "$((SECONDS-t0))秒")"
+    notify "改配置成功" "$SEL_NAME" "变更：${oc0%.*}核/${mm0%.*}G → ${oc1%.*}核/${mm1%.*}G" "状态：$st" "公网IP：${ip:-—}"
+  else
+    echo "$(_t "未在时限内恢复运行，当前状态：%s" "L_REBOOT_TIMEOUT" "${st:-未知}")"
+    notify "改配置失败" "$SEL_NAME" "原因：超时未恢复 RUNNING" "当前状态：${st:-未知}"
+  fi
+}
+inst_delete(){
+  pick_instance || return
+  local ip; ip=$(_inst_ip "$SEL_ID")
+  # 额外挂载的块存储卷：删实例后会保留并继续计费
+  local vols; vols=$(o compute volume-attachment list -c "$TENANCY" --instance-id "$SEL_ID" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"=="ATTACHED")|."volume-id"' 2>/dev/null)
+  if [ -n "$vols" ]; then
+    echo "$(_t "⚠️ 这台实例还挂着以下块存储卷，删实例后它们会保留并继续计费（可之后用 存储→7 删除）：" "L_ATTACHED_VOLS")"
+    local v; while read -r v; do [ -z "$v" ] && continue
+      o bv volume get --volume-id "$v" 2>/dev/null | jq -r '.data|"   \(."display-name")  \(."size-in-gbs")G"'; done <<< "$vols"
+  fi
+  _ask -rp "$(_t "确认永久删除 %s（公网IP %s）？输 yes 确认: " "L_ASK_DEL_INST" "$SEL_NAME" "${ip:-无}")" c; [ "$c" != yes ] && return
+  # 和官网一样：询问是否一并删除引导卷
+  local delbv="y"; _ask -rp "是否一并删除引导卷？(y=删除/n=保留，保留会继续计费) [y]: " delbv; delbv="${delbv:-y}"
+  local preserve="false"; [ "$delbv" = "n" ] || [ "$delbv" = "N" ] && preserve="true"
+  [ "$preserve" = "true" ] && echo "$(_t "⚠️ 引导卷将保留，之后仍会计费（可在 3引导卷 → 7删除未挂载的盘 清理）。" "L_BOOT_KEPT")"
+  local out; out=$(o compute instance terminate --instance-id "$SEL_ID" --preserve-boot-volume "$preserve" --force 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$(_t "已提交，等待删除完成（最多5分钟）" "L_WAIT_DELETE")"; local st; st=$(_wait_state "$SEL_ID" TERMINATED 300)
+    if [ "$st" = TERMINATED ]; then echo "$(_t "已删除。" "L_DELETED")"; notify "删除" "$SEL_NAME" "公网IP：${ip:-—}" "状态：TERMINATED"
+    else echo "$(_t "未在时限内完成，当前：%s" "L_DELETE_TIMEOUT" "${st:-未知}")"; notify "删除失败" "$SEL_NAME" "原因：超时未完成删除" "当前状态：${st:-未知}"; fi
+  else echo "失败：$(_oci_err "$out")"; notify "删除失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; fi
+}
+inst_rename(){
+  pick_instance || return
+  local nn; _ask -rp "新名称: " nn; [ -z "$nn" ] && return
+  _confirm "确认 $SEL_NAME → $nn？" || return
+  local out; out=$(o compute instance update --instance-id "$SEL_ID" --display-name "$nn" --force 2>&1)
+  local now; now=$(o compute instance get --instance-id "$SEL_ID" --query 'data."display-name"' --raw-output 2>/dev/null)
+  if [ "$now" = "$nn" ]; then echo "$(_t "已改名为 %s" "L_RENAMED" "$nn")"; notify "改名" "$SEL_NAME" "新名称：$nn" "状态：已生效"
+  else local e; e=$(_oci_err "$out"); [ -z "$e" ] && e="回读名称为 ${now:-空}"; echo "$(_t "失败：%s" "L_FAILED_E" "$e")"; notify "改名失败" "$SEL_NAME" "原因：$e"; fi
+  pause
+}
+# 建默认网络：VCN+网关+路由+子网，回显子网OCID（失败返回1，进度走stderr）
+# $1=VCN网段 $2=子网网段 $3=名称前缀
+_create_default_network(){
+  local vcn_cidr="${1:-10.0.0.0/16}" sub_cidr="${2:-10.0.0.0/24}" nprefix="${3:-oci-cn}"
+  local vcn ig rt sub
+  echo "$(_t "  建 VCN (%s)..." "L_BUILD_VCN" "$vcn_cidr")" >&2
+  vcn=$(o network vcn create -c "$TENANCY" --cidr-block "$vcn_cidr" --display-name "${nprefix}-vcn" --query 'data.id' --raw-output 2>/dev/null)
+  [[ "$vcn" == ocid1.vcn* ]] || return 1
+  echo "$(_t "  建互联网网关..." "L_BUILD_IG")" >&2
+  ig=$(o network internet-gateway create -c "$TENANCY" --is-enabled true --vcn-id "$vcn" --display-name "${nprefix}-ig" --query 'data.id' --raw-output 2>/dev/null)
+  [[ "$ig" == ocid1.internetgateway* ]] || return 1
+  echo "$(_t "  配路由..." "L_BUILD_RT")" >&2
+  rt=$(o network route-table list -c "$TENANCY" --vcn-id "$vcn" --query 'data[0].id' --raw-output 2>/dev/null)
+  o network route-table update --rt-id "$rt" --route-rules "[{\"cidrBlock\":\"0.0.0.0/0\",\"networkEntityId\":\"$ig\"}]" --force >/dev/null 2>&1
+  echo "$(_t "  建子网 (%s)..." "L_BUILD_SUBNET" "$sub_cidr")" >&2
+  sub=$(o network subnet create -c "$TENANCY" --vcn-id "$vcn" --cidr-block "$sub_cidr" --display-name "${nprefix}-subnet" --query 'data.id' --raw-output 2>/dev/null)
+  [[ "$sub" == ocid1.subnet* ]] || return 1
+  echo "$sub"
+}
+inst_create(){
+  echo "$(_t "单次创建实例（失败即报错）" "L_CREATE_TITLE")"
+  local ads; ads=$(o iam availability-domain list --query 'data[].name' 2>/dev/null | jq -r '.[]' 2>/dev/null)
+  local ad; ad=$(head -1 <<< "$ads")
+  if [ "$(grep -c . <<< "$ads")" -gt 1 ]; then
+    echo "$(_t "可用域：" "L_AD_LIST")"; local k=0 x; local -a A=(); while read -r x; do [ -z "$x" ] && continue; k=$((k+1)); A[$k]="$x"; echo "   $k  $x"; done <<< "$ads"
+    _askc "$(_t "选择可用域编号" "L_CHOOSE_AD")" x "1" || return; ad="${A[$x]}"
+  else
+    _askc "$(_t "可用域" "L_AD")" x "$ad" || return; ad="$x"
+  fi
+  [ -z "$ad" ] && { echo "$(_t "读取可用域失败" "L_AD_FAIL")"; return; }
+  # 实例类型：免费额度 vs 付费（免费仅 E2.Micro/A1.Flex，但可用性走 API 实时查）
+  echo "$(_t "实例类型: 1=免费额度(只显示E2.Micro/A1.Flex)  2=付费(全部机型)" "L_INST_TYPE")"; _askc "选择" insttype || return
+  local freeonly=0
+  case "$insttype" in 1) freeonly=1;; 2) freeonly=0;; *) echo "无效"; return;; esac
+  # 机型：从 API 实时拉取该可用域全部可用规格（替代写死的二选一）
+  echo "$(_t "读取可用机型（该可用域实时提供）..." "L_READING_SHAPES")"
+  local shapes_json; shapes_json=$(o compute shape list -c "$TENANCY" --availability-domain "$ad" --all 2>/dev/null)
+  local shapes; shapes=$(echo "$shapes_json" | jq -r '.data[] | [.shape, (.["processor-description"]//""), ((.ocpus//0)|tostring), ((.["memory-in-gbs"]//0)|tostring)] | @tsv' 2>/dev/null)
+  [ -z "$shapes" ] && { echo "$(_t "无法读取机型列表，检查网络/权限" "L_SHAPES_FAIL")"; return; }
+  local -a SHAPE=() SHPROC=() SHOCPU=() SHMEM=() SHFLEX=(); local i=0
+  # 先收集全部，再分两批显示：免费机型置顶（仅付费模式），其余按原顺序
+  local -a _ALL=()
+  while IFS=$'\t' read -r sh proc ocpu mem; do
+    [ -z "$sh" ] && continue
+    # 免费模式：只保留 E2.Micro 和 A1.Flex
+    if [ "$freeonly" = 1 ]; then
+      case "$sh" in VM.Standard.E2.1.Micro|VM.Standard.A1.Flex) ;; *) continue;; esac
+    fi
+    _ALL+=("$sh"$'\t'"$proc"$'\t'"$ocpu"$'\t'"$mem")
+  done <<< "$shapes"
+  local -a _ORDERED=()
+  if [ "$freeonly" = 0 ]; then
+    # 付费模式：免费机型置顶
+    for _e in "${_ALL[@]}"; do case "${_e%%$'\t'*}" in VM.Standard.E2.1.Micro|VM.Standard.A1.Flex) _ORDERED+=("$_e");; esac; done
+  fi
+  for _e in "${_ALL[@]}"; do
+    local _sh="${_e%%$'\t'*}"
+    case "$_sh" in VM.Standard.E2.1.Micro|VM.Standard.A1.Flex) [ "$freeonly" = 0 ] && continue;; esac
+    _ORDERED+=("$_e")
+  done
+  for _e in "${_ORDERED[@]}"; do
+    IFS=$'\t' read -r sh proc ocpu mem <<< "$_e"
+    i=$((i+1))
+    SHAPE[$i]="$sh"; SHPROC[$i]="$proc"
+    # Flex 机型：名字含 .Flex，可自定义核/内存（API 返回的是默认值，不能当固定规格）
+    if [[ "$sh" == *.Flex ]]; then SHFLEX[$i]=1; SHOCPU[$i]=""; SHMEM[$i]=""
+    else SHFLEX[$i]=0; SHOCPU[$i]="${ocpu%.*}"; SHMEM[$i]="${mem%.*}"; fi
+    local spec ftag=""
+    if [ "${SHFLEX[$i]}" = 1 ]; then spec="Flex(自定义核/内存)"; else spec="${SHOCPU[$i]}核/${SHMEM[$i]}G"; fi
+    case "$sh" in VM.Standard.E2.1.Micro|VM.Standard.A1.Flex)
+      if [ "${OCI_REGION}" = "${HOME_REGION:-$OCI_REGION}" ]; then ftag=" [免费]"
+      else ftag=" [副区域计费]"; fi;; esac
+    printf "  %2s  %-28s %-18s %s%s\n" "$i" "$sh" "$spec" "$proc" "$ftag"
+  done
+  if [ "$i" -eq 0 ]; then
+    if [ "$freeonly" = 1 ]; then echo "$(_t "❌ 该可用域（%s）不提供免费机型（E2.Micro/A1.Flex），换可用域或选付费。" "L_NO_FREE_SHAPE" "${ad##*:}")"; else echo "$(_t "该可用域无可用机型" "L_NO_SHAPES")"; fi
+    return
+  fi
+  local si; _askc "$(_t "选择机型编号" "L_CHOOSE_SHAPE")" si || return; local shape="${SHAPE[$si]}"; [ -z "$shape" ] && { echo "无效"; return; }
+  local shapecfg="" oc="1" mm="1" cfgdesc
+  if [ "${SHFLEX[$si]}" = 1 ]; then
+    # 从 API 实时获取该 Flex 机型的官方约束（min/max OCPU、min/max 内存）
+    echo "$(_t "读取 %s 官方规格约束..." "L_READING_CONSTRAINTS" "$shape")"
+    local shape_detail; shape_detail=$(o compute shape get -c "$TENANCY" --availability-domain "$ad" --shape-name "$shape" 2>/dev/null)
+    local min_ocpu=1 max_ocpu=64 min_mem_per_ocpu=1 max_mem_per_ocpu=64
+    if [ -n "$shape_detail" ]; then
+      local _v
+      _v=$(echo "$shape_detail" | jq -r '.data."ocpu-options"."min-in-gbs // .data."ocpu-options".min // empty' 2>/dev/null); [ -n "$_v" ] && min_ocpu="${_v%.*}"
+      _v=$(echo "$shape_detail" | jq -r '.data."ocpu-options".max // empty' 2>/dev/null); [ -n "$_v" ] && max_ocpu="${_v%.*}"
+      _v=$(echo "$shape_detail" | jq -r '.data."memory-options"."min-per-ocpu-in-gbs" // empty' 2>/dev/null); [ -n "$_v" ] && min_mem_per_ocpu="${_v%.*}"
+      _v=$(echo "$shape_detail" | jq -r '.data."memory-options"."max-per-ocpu-in-gbs" // empty' 2>/dev/null); [ -n "$_v" ] && max_mem_per_ocpu="${_v%.*}"
+    fi
+    echo "  约束：OCPU ${min_ocpu}~${max_ocpu}，内存每核 ${min_mem_per_ocpu}~${max_mem_per_ocpu}G"
+    _askc "$(_t "OCPU数量" "L_OCPU_COUNT")" oc || return; _askc "$(_t "内存GB" "L_MEMORY_GB")" mm || return
+    _is_int "$oc" && _is_int "$mm" && [ "$oc" -ge 1 ] && [ "$mm" -ge 1 ] || { echo "$(_t "OCPU/内存必须是正整数" "L_OCPU_MEM_INT")"; return; }
+    [ "$oc" -lt "$min_ocpu" ] || [ "$oc" -gt "$max_ocpu" ] && { echo "$(_t "❌ OCPU 必须在 %s~%s 之间（官方约束）" "L_OCPU_RANGE" "${min_ocpu}" "${max_ocpu}")"; return; }
+    local _min_mem=$((oc * min_mem_per_ocpu)); [ "$_min_mem" -lt 1 ] && _min_mem=1
+    local _max_mem=$((oc * max_mem_per_ocpu))
+    { [ "$mm" -lt "$_min_mem" ] || [ "$mm" -gt "$_max_mem" ]; } && { echo "❌ ${oc}核内存必须在 ${_min_mem}~${_max_mem}G 之间（官方约束：每核 ${min_mem_per_ocpu}~${max_mem_per_ocpu}G）"; return; }
+    if [ "$shape" = "VM.Standard.A1.Flex" ] && { [ "$oc" -gt 4 ] || [ "$mm" -gt 24 ]; }; then
+      _ask -rp "⚠️ 超出免费额度（4核/24G）会收费，确认输 yes: " c; [ "$c" = yes ] || return
+    fi
+    shapecfg="--shape-config {\"ocpus\":$oc,\"memoryInGBs\":$mm}"; cfgdesc="${oc}核/${mm}G"
+  else
+    cfgdesc="${SHOCPU[$si]}核/${SHMEM[$si]}G"
+  fi
+  # 预检查：所选机型在该可用域的配额（仅对已知免费规格做精确检查，其他依赖 API 报错）
+  echo "$(_t "检查额度..." "L_CHECK_QUOTA")"
+  local lname="" need=0
+  case "$shape" in
+    VM.Standard.E2.1.Micro) lname="standard-e2-micro-core-count"; need=1;;
+    VM.Standard.A1.Flex) lname="standard-a1-core-count"; need="$oc";;
+  esac
+  if [ -n "$lname" ]; then
+    local u a; IFS=$'\t' read -r u a < <(_limit_avail "$lname" "$ad")
+    if [ -n "$a" ] && [ "${a%.*}" -lt "$need" ]; then echo "❌ 额度不足：$lname 已用 ${u%.*}，可用 ${a%.*}，本次需要 $need。"; return; fi
+  fi
+  # 引导卷大小：检查已有存储卷（引导卷+块存储卷，未挂载仍产生费用）+ 动态阈值
+  echo "$(_t "检查已有存储卷（引导卷+块存储卷，未挂载仍产生费用）..." "L_CHECK_VOLS")"
+  local bv_used=0 bv_count=0 bv_detail=""
+  # 引导卷
+  local _szs; _szs=$(o bv boot-volume list -c "$TENANCY" --query 'data[].["size-in-gbs","display-name"]' 2>/dev/null | jq -r '.[]|@tsv' 2>/dev/null)
+  while IFS=$'\t' read -r _sz _nm; do
+    [ -z "$_sz" ] && continue; bv_used=$((bv_used + ${_sz%.*})); bv_count=$((bv_count+1))
+    bv_detail="${bv_detail}引导卷:${_nm:-?}(${_sz%.*}G) "
+  done <<< "$_szs"
+  # 块存储卷
+  _szs=$(o bv volume list -c "$TENANCY" --query 'data[].["size-in-gbs","display-name"]' 2>/dev/null | jq -r '.[]|@tsv' 2>/dev/null)
+  while IFS=$'\t' read -r _sz _nm; do
+    [ -z "$_sz" ] && continue; bv_used=$((bv_used + ${_sz%.*})); bv_count=$((bv_count+1))
+    bv_detail="${bv_detail}块存储:${_nm:-?}(${_sz%.*}G) "
+  done <<< "$_szs"
+  if [ "$bv_count" -gt 0 ]; then
+    echo "$(_t "  已有存储卷 %s 个，合计 %sG（含未挂载卷，仍计入费用）" "L_VOLS_SUMMARY" "${bv_count}" "${bv_used}")"
+    echo "$(_t "  明细：%s" "L_VOLS_DETAIL" "$bv_detail")"
+    if [ "$bv_used" -gt 200 ]; then
+      echo "$(_t "  ⚠️ 已超过免费额度 200G，继续创建将产生费用。" "L_OVER_FREE")"
+      echo "$(_t "     可返回主菜单 → 3引导卷 → 7删除未挂载的盘，释放额度后再创建。" "L_FREE_HINT")"
+    fi
+  else
+    echo "$(_t "  该租户暂无存储卷" "L_NO_VOLS")"
+  fi
+  local bvsz; _ask -rp "引导卷大小GB（留空=镜像默认，最小50，输 0 取消）: " bvsz; [ "$bvsz" = "0" ] && { echo "$(_t "已取消" "L_CANCELLED")"; return; }
+  local bvopt=""
+  if [ -n "$bvsz" ]; then
+    _is_int "$bvsz" && [ "$bvsz" -ge 50 ] || { echo "$(_t "必须是 ≥50 的整数" "L_GE_50")"; return; }
+    local bv_total=$((bv_used + bvsz))
+    if [ "$bvsz" -gt 500 ]; then _ask -rp "$(_t "⚠️ 单盘超过500G，确认输 yes: " "L_ASK_OVER500")" c; [ "$c" = yes ] || return; fi
+    if [ "$bv_total" -gt 200 ]; then _ask -rp "⚠️ 加上已有 ${bv_used}G，合计 ${bv_total}G 超过免费额度200G会收费，确认输 yes: " c; [ "$c" = yes ] || return; fi
+    bvopt="--boot-volume-size-in-gbs $bvsz"
+  fi
+  # 子网：编号选择；没有则自动建
+  echo "$(_t "读取子网..." "L_READING_SUBNETS")"
+  local subs; subs=$(o network subnet list -c "$TENANCY" --query 'data[].["display-name",id]' 2>/dev/null | jq -r '.[]|@tsv')
+  local subnet="" subname=""
+  if [ -z "$subs" ]; then
+    echo "$(_t "该区域没有子网（新账号/新区域）。" "L_NO_SUBNETS")"
+    _confirm "自动创建默认网络（VCN+子网+网关+放行）？" || return
+    local vcn_cidr sub_cidr nprefix
+    _askc "$(_t "VCN 网段" "L_VCN_CIDR")" vcn_cidr "10.0.0.0/16" || return
+    _askc "$(_t "子网网段" "L_SUBNET_CIDR")" sub_cidr "10.0.0.0/24" || return
+    _askc "$(_t "名称前缀" "L_NAME_PREFIX")" nprefix "oci-cn" || return
+    subnet=$(_create_default_network "$vcn_cidr" "$sub_cidr" "$nprefix") || { echo "$(_t "建网络失败" "L_NET_FAIL")"; return; }
+    subname="${nprefix}-subnet（自动创建）"; echo "$(_t "默认网络已建，子网就绪。" "L_NET_READY")"
+  else
+    local -a SUBID=() SUBNM=(); local i=0
+    while IFS=$'\t' read -r sn sid; do [ -z "$sid" ] && continue; i=$((i+1)); SUBID[$i]="$sid"; SUBNM[$i]="$sn"; printf "  %s  %s\n" "$i" "$sn"; done <<< "$subs"
+    _askc "$(_t "选择子网编号" "L_CHOOSE_SUBNET")" si || return; subnet="${SUBID[$si]}"; subname="${SUBNM[$si]}"; [ -z "$subnet" ] && { echo "无效"; return; }
+  fi
+  # 镜像
+  echo "$(_t "读取可用系统镜像（该区域实际可用）..." "L_READING_IMAGES")"
+  local imgs; imgs=$(o compute image list -c "$TENANCY" --shape "$shape" --sort-by TIMECREATED --sort-order DESC \
+    --query 'data[].["display-name",id]' 2>/dev/null | jq -r '.[]|@tsv')
+  [ -z "$imgs" ] && { echo "$(_t "无可用镜像" "L_NO_IMAGES")"; return; }
+  local -a IMGID=() IMGNM=(); i=0
+  while IFS=$'\t' read -r inm iid; do
+    [ -z "$iid" ] && continue; i=$((i+1)); IMGID[$i]="$iid"; IMGNM[$i]="$inm"; printf "  %s  %s\n" "$i" "$inm"
+  done <<< "$imgs"
+  echo "（共 $i 个镜像，按发布时间倒序）"
+  _askc "$(_t "选择系统编号" "L_CHOOSE_IMAGE")" ii2 || return; local image="${IMGID[$ii2]}" imgname="${IMGNM[$ii2]}"; [ -z "$image" ] && { echo "无效"; return; }
+  # 公钥 + 名称
+  echo "$(_t "粘贴 SSH 公钥（ssh-ed25519... 或 ssh-rsa...，一行）：" "L_PASTE_PUBKEY")"
+  _ask -r pubkey
+  [[ "$pubkey" == ssh-* ]] || { echo "$(_t "不是有效公钥" "L_INVALID_PUBKEY")"; return; }
+  local iname; _askc "$(_t "实例名" "L_INST_NAME")" iname || return; [ -z "$iname" ] && { echo "$(_t "实例名不能为空" "L_NAME_REQUIRED")"; return; }
+  # 汇总确认
+  line
+  echo "  实例名：$iname"
+  echo "  规格：  $shape  $cfgdesc"
+  echo "  硬盘：  ${bvsz:-默认约47}G"
+  echo "  系统：  $imgname"
+  echo "  子网：  $subname"
+  echo "  可用域：$ad"
+  line
+  _confirm "确认创建？" || return
+  echo "$(_t "创建中..." "L_CREATING")"
+  local meta; meta=$(jq -nc --arg k "$pubkey" '{ssh_authorized_keys:$k}')
+  local out newid t0=$SECONDS
+  out=$(o compute instance launch --availability-domain "$ad" -c "$TENANCY" --shape "$shape" $shapecfg $bvopt \
+    --subnet-id "$subnet" --image-id "$image" --display-name "$iname" \
+    --metadata "$meta" --assign-public-ip true --query 'data.id' --raw-output 2>&1)
+  newid=$(echo "$out" | grep -m1 '^ocid1.instance')
+  if [ -z "$newid" ]; then
+    echo "失败：$(_oci_err "$out")"; notify "创建失败" "$iname" "规格：$cfgdesc" "原因：$(_oci_err "$out")"; return
+  fi
+  echo "已提交，等待实例运行（最多10分钟）"
+  local st ip; st=$(_wait_state "$newid" RUNNING 600); ip=$(_inst_ip "$newid")
+  if [ "$st" = RUNNING ]; then
+    echo "创建完成：$iname  公网IP：${ip:-无}  耗时：$((SECONDS-t0))秒"
+    notify "创建成功" "$iname" "规格：$cfgdesc / 硬盘${bvsz:-47}G" "系统：$imgname" "公网IP：${ip:-—}" "状态：RUNNING"
+  else
+    echo "已创建但未在时限内运行，当前状态：${st:-未知}"
+    notify "创建失败" "$iname" "原因：超时未达到 RUNNING" "当前状态：${st:-未知}"
+  fi
+}
+
+# ============ IP ============
+_primary_pip(){ local vnic; vnic=$(o compute instance list-vnics --instance-id "$1" --query 'data[0].id' --raw-output); o network private-ip list --vnic-id "$vnic" --query 'data[?"is-primary"].id|[0]' --raw-output; }
+inst_change_ip(){
+  pick_instance || return; local pip; pip=$(_primary_pip "$SEL_ID")
+  local oid life oip cid
+  IFS=$'\t' read -r oid life oip < <(o network public-ip get --private-ip-id "$pip" --query 'data.[id,lifetime,"ip-address"]' 2>/dev/null | jq -r '@tsv')
+  [ "$life" = "RESERVED" ] && { echo "保留IP（$oip），不更换。"; return; }
+  local cfnote=""; [ -f "$CF_FILE" ] && { local _d; _d=$(sed -n '4p' "$CF_FILE"); cfnote="，${_d:-域名}中指向它的DNS记录会自动改"; }
+  _confirm "确认更换 $SEL_NAME 的公网IP（当前 ${oip:-无}${cfnote}）？" || return
+  cid=$(o compute instance get --instance-id "$SEL_ID" --query 'data."compartment-id"' --raw-output)
+  [ -n "$oid" ] && [ "$oid" != null ] && { o network public-ip delete --public-ip-id "$oid" --force >/dev/null 2>&1; echo "已释放旧IP $oip"; }
+  local i new
+  for i in 1 2 3; do [ "$INTR" = 1 ] && { INTR=0; echo 已中断; return; }; sleep 4; new=$(o network public-ip create -c "$cid" --lifetime EPHEMERAL --private-ip-id "$pip" --query 'data."ip-address"' --raw-output 2>/dev/null) && { local chk; chk=$(_inst_ip "$SEL_ID"); echo "新IP：$new（回读：${chk:-未取到}）"; notify "换IP成功" "$SEL_NAME" "旧IP：${oip}" "新IP：${new}" "状态：$([ "$chk" = "$new" ] && echo 已绑定 || echo "已分配，回读为 ${chk:-空}")"; cf_update_ip "$oip" "$new"; return; }; echo "第 $i 次失败，重试..."; done
+  echo "分配失败。"; notify "换IP失败" "$SEL_NAME"
+}
+inst_ipv6(){
+  pick_instance || return
+  _confirm "确认给 $SEL_NAME 附加一个 IPv6 地址？（子网需已启用IPv6）" || return
+  local vnic out; vnic=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[0].id' --raw-output)
+  out=$(o network ipv6 create --vnic-id "$vnic" --query 'data."ip-address"' --raw-output 2>&1)
+  local v6; v6=$(echo "$out" | grep -m1 ':' | grep -v '"' )
+  if [[ "$v6" == *:* ]]; then echo "已附加：$v6"; notify "附IPv6成功" "$SEL_NAME" "新IPv6：$v6" "状态：已分配"
+  else echo "失败：$(_oci_err "$out")"; notify "附IPv6失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; fi
+}
+
+# ============ 虚拟云网络 ============
+net_effective(){
+  pick_instance || return
+  _show_effective
+}
+# 显示 SEL_ID/SEL_NAME 实例生效的安全列表与 NSG 入站规则（交互菜单与 --list-rules CLI 共用）
+# 依赖全局量：SEL_ID SEL_NAME ACC_NAME OCI_REGION OCI_CFG
+_show_effective(){
+  local sid; sid=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output)
+  local sname; sname=$(o network subnet get --subnet-id "$sid" --query 'data."display-name"' --raw-output)
+  echo "实例 $SEL_NAME → 子网 $sname"; line
+  local push_rules=""
+  local sls; sls=$(o network subnet get --subnet-id "$sid" --query 'data."security-list-ids"' 2>/dev/null | jq -r '.[]')
+  for slid in $sls; do
+    local slname; slname=$(o network security-list get --security-list-id "$slid" --query 'data."display-name"' --raw-output)
+    echo "[安全列表：$slname] 入站："
+    local r; r=$(o network security-list get --security-list-id "$slid" --query 'data."ingress-security-rules"' 2>/dev/null | _fmt_rules)
+    echo "$r"
+    push_rules="${push_rules}$(echo "$r" | sed 's/^  //;s/$/  /')
+"
+  done
+  local nsgs; nsgs=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[0]."nsg-ids"' 2>/dev/null | jq -r '.[]?')
+  for ng in $nsgs; do
+    [ -z "$ng" ] && continue
+    local ngn; ngn=$(o network nsg get --nsg-id "$ng" --query 'data."display-name"' --raw-output)
+    echo "[NSG：$ngn] 入站："
+    o network nsg rules list --nsg-id "$ng" --query 'data[?direction==`"INGRESS"`]' 2>/dev/null | _fmt_rules
+  done
+  notify "查看端口规则" "$SEL_NAME" "子网：$sname" "入站规则：
+${push_rules}"
+}
+# 解析规则：协议名 + 端口 + 来源（表头与"全部"走双语）
+_fmt_rules(){
+  local _all _h1 _h2 _h3
+  _all="$(_t "全部" "L_PROTO_ALL")"; _h1="$(_t "协议" "L_COL_PROTO")"
+  _h2="$(_t "端口" "L_COL_PORT")"; _h3="$(_t "来源" "L_COL_SRC")"
+  jq -r --arg all "$_all" '.[] |
+    ( if .protocol=="6" then "TCP"
+      elif .protocol=="17" then "UDP"
+      elif .protocol=="1" then "ICMP"
+      elif .protocol=="all" then $all
+      else .protocol end ) as $p |
+    ( (."tcp-options"."destination-port-range" // ."tcpOptions"."destinationPortRange" // ."udp-options"."destination-port-range" // ."udpOptions"."destinationPortRange") as $r |
+      if $r==null then (if .protocol=="6" or .protocol=="17" then $all else "-" end)
+      elif $r.min==$r.max then ($r.min|tostring)
+      else "\($r.min)-\($r.max)" end ) as $port |
+    [$p, $port, .source] | @tsv' 2>/dev/null \
+  | awk -F'\t' -v h1="$_h1" -v h2="$_h2" -v h3="$_h3" 'BEGIN{printf "  %-6s %-12s %s\n",h1,h2,h3} {printf "  %-6s %-12s %s\n",$1,$2,$3}'
+}
+# 取选中实例所挂子网绑定的安全列表，列出让用户确认或改选 -> 设 SEL_SLID / SEL_SLNAME
+_pick_seclist(){
+  local sid; sid=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output 2>/dev/null)
+  local sname; sname=$(o network subnet get --subnet-id "$sid" --query 'data."display-name"' --raw-output 2>/dev/null)
+  local ids; ids=$(o network subnet get --subnet-id "$sid" --query 'data."security-list-ids"' 2>/dev/null | jq -r '.[]')
+  local -a arr=(); local n=0 x
+  for x in $ids; do n=$((n+1)); arr[$n]="$x"; done
+  if [ "$n" -eq 0 ]; then echo "子网 $sname 未绑定安全列表"; return 1; fi
+  echo "实例所在子网 $sname 绑定的安全列表："
+  local k
+  for k in $(seq 1 $n); do
+    local nm; nm=$(o network security-list get --security-list-id "${arr[$k]}" --query 'data."display-name"' --raw-output 2>/dev/null)
+    local def=""; [ "$k" = 1 ] && def="  ← 默认"
+    echo "  $k  $nm$def"
+  done
+  _ask -rp "$(_t "回车用默认(1)，或输编号改选: " "L_ASK_DEFAULT1")" sel
+  [ -z "$sel" ] && sel=1
+  SEL_SLID="${arr[$sel]}"; [ -z "$SEL_SLID" ] && { echo "无效"; return 1; }
+  SEL_SLNAME=$(o network security-list get --security-list-id "$SEL_SLID" --query 'data."display-name"' --raw-output 2>/dev/null)
+  return 0
+}
+# 显示某安全列表的入站规则（带编号），供开放/关闭复用
+_show_rules(){  # $1=slid
+  local cur; cur=$(o network security-list get --security-list-id "$1" --query 'data."ingress-security-rules"' 2>/dev/null)
+  echo "$(_t "当前入站规则：" "L_CUR_RULES")"
+  local _all _pw _src
+  _all="$(_t "全部" "L_PROTO_ALL")"; _pw="$(_t "端口" "L_COL_PORT")"; _src="$(_t "来源" "L_COL_SRC")"
+  echo "$cur" | jq -r --arg all "$_all" --arg pw "$_pw" --arg src "$_src" 'to_entries[] |
+    ( if .value.protocol=="6" then "TCP" elif .value.protocol=="17" then "UDP"
+      elif .value.protocol=="1" then "ICMP" elif .value.protocol=="all" then $all
+      else .value.protocol end ) as $p |
+    ( (.value."tcp-options"."destination-port-range" // .value."tcpOptions"."destinationPortRange" // .value."udp-options"."destination-port-range" // .value."udpOptions"."destinationPortRange") as $r |
+      if $r==null then (if .value.protocol=="6" or .value.protocol=="17" then $all else "-" end)
+      elif $r.min==$r.max then ($r.min|tostring) else "\($r.min)-\($r.max)" end ) as $port |
+    "  [\(.key)] \($p)  \($pw) \($port)  \($src) \(.value.source)"' 2>/dev/null
+  [ -z "$cur" ] || [ "$cur" = "[]" ] && echo "  $(_t "（无规则）" "L_NO_RULES")"
+}
+net_open_port(){
+  pick_instance || return
+  _pick_seclist || return
+  local slid="$SEL_SLID"
+  echo "将修改：$SEL_SLNAME（同子网所有实例生效）"
+  _show_rules "$slid"
+  _ask -rp "协议(tcp/udp/all): " proto
+  case "$proto" in tcp|udp|all) ;; *) echo "协议只能是 tcp/udp/all"; return;; esac
+  local port="" pmin=1 pmax=65535
+  if [ "$proto" != all ]; then
+    _ask -rp "端口(如443或8000-8100): " port
+    if [[ "$port" == *-* ]]; then pmin="${port%-*}"; pmax="${port#*-}"; else pmin="$port"; pmax="$port"; fi
+    _is_int "$pmin" && _is_int "$pmax" && [ "$pmin" -ge 1 ] && [ "$pmax" -le 65535 ] && [ "$pmin" -le "$pmax" ] || { echo "端口无效（1-65535）"; return; }
+  else port="全部"; fi
+  local newrule
+  case "$proto" in
+    all) newrule='{"protocol":"all","source":"0.0.0.0/0","isStateless":false}';;
+    udp) newrule="{\"protocol\":\"17\",\"source\":\"0.0.0.0/0\",\"isStateless\":false,\"udpOptions\":{\"destinationPortRange\":{\"min\":$pmin,\"max\":$pmax}}}";;
+    *)   newrule="{\"protocol\":\"6\",\"source\":\"0.0.0.0/0\",\"isStateless\":false,\"tcpOptions\":{\"destinationPortRange\":{\"min\":$pmin,\"max\":$pmax}}}";;
+  esac
+  local cur merged
+  cur=$(o network security-list get --security-list-id "$slid" --query 'data."ingress-security-rules"' 2>/dev/null)
+  merged=$(echo "$cur" | jq -c ". + [$newrule]")
+  # v6.5：执行前先展示执行后的完整规则（diff 确认）
+  local _n; _n=$(echo "$merged" | jq 'length' 2>/dev/null || echo "?")
+  echo "$(_t "将开放 %s %s（来源0.0.0.0/0），执行后入站规则将变为（共 %s 条）：" "L_AFTER_RULES" "$proto" "$port" "${_n}")"
+  echo "$merged" | _fmt_rules
+  _confirm "$(_t "确认执行以上变更？（同子网所有实例生效）" "L_CONFIRM_APPLY")" || { echo "$(_t "已取消" "L_CANCELLED")"; return; }
+  local out; out=$(o network security-list update --security-list-id "$slid" --ingress-security-rules "$merged" --force 2>&1)
+  if [ $? -eq 0 ]; then echo "已开放 $proto $port"; notify "开放端口成功" "$SEL_NAME" "端口：$proto $port" "状态：已生效，当前入站规则 $(_sl_count "$slid") 条"
+  else echo "失败：$(_oci_err "$out")"; notify "开放端口失败" "$SEL_NAME" "端口：$proto $port" "原因：$(_oci_err "$out")"; fi
+}
+# 回读安全列表入站规则条数
+_sl_count(){ o network security-list get --security-list-id "$1" --query 'length(data."ingress-security-rules")' --raw-output 2>/dev/null; }
+net_open_all(){
+  pick_instance || return
+  _pick_seclist || return
+  local slid="$SEL_SLID"
+  _ask -rp "$(_t "确认放行全部端口？安全列表 %s，同子网所有实例生效 (yes/n): " "L_ASK_OPEN_ALL" "$SEL_SLNAME")" c; [ "$c" != yes ] && return
+  local out; out=$(o network security-list update --security-list-id "$slid" --ingress-security-rules '[{"protocol":"all","source":"0.0.0.0/0","isStateless":false}]' --force 2>&1)
+  if [ $? -eq 0 ]; then echo "已放行。"; notify "放行全部" "$SEL_NAME" "已放行所有端口（原规则已替换）" "状态：已生效，当前入站规则 $(_sl_count "$slid") 条"
+  else echo "失败：$(_oci_err "$out")"; notify "放行全部失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; fi
+}
+net_close_port(){
+  pick_instance || return
+  _pick_seclist || return
+  local slid="$SEL_SLID"
+  echo "安全列表：$SEL_SLNAME"
+  local cur; cur=$(o network security-list get --security-list-id "$slid" --query 'data."ingress-security-rules"' 2>/dev/null)
+  _show_rules "$slid"
+  _ask -rp "输入要删除的编号（多个用空格）: " nums
+  [ -z "$nums" ] && return
+  local delexpr="["; for n in $nums; do delexpr+="$n,"; done; delexpr="${delexpr%,}]"
+  local merged; merged=$(echo "$cur" | jq -c "del(.[$delexpr[]])" 2>/dev/null)
+  [ -z "$merged" ] && { echo "编号有误"; return; }
+  # v6.5：执行前先展示删除后的完整规则（diff 确认）
+  local _n; _n=$(echo "$merged" | jq 'length' 2>/dev/null || echo "?")
+  echo "$(_t "将删除规则编号：%s，删除后入站规则将变为（剩余 %s 条）：" "L_AFTER_DEL_RULES" "$nums" "${_n}")"
+  echo "$merged" | _fmt_rules
+  _ask -rp "$(_t "确认删除？同子网所有实例生效 (y/n): " "L_CONFIRM_DEL")" c; [ "$c" != y ] && { echo "$(_t "已取消" "L_CANCELLED")"; return; }
+  local out; out=$(o network security-list update --security-list-id "$slid" --ingress-security-rules "$merged" --force 2>&1)
+  if [ $? -eq 0 ]; then echo "$(_t "已删除。" "L_DELETED")"; notify "关闭端口成功" "$SEL_NAME" "已删除规则编号：$nums" "状态：已生效，当前入站规则 $(_sl_count "$slid") 条"
+  else echo "失败：$(_oci_err "$out")"; notify "关闭端口失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; fi
+}
+net_list_all(){
+  echo "本区域子网 → 承载实例："
+  local subs; subs=$(o network subnet list -c "$TENANCY" --query 'data[].["display-name","cidr-block",id]' 2>/dev/null | jq -r '.[]|@tsv')
+  # 预取实例与其子网映射
+  declare -A MAP
+  local d; d=$(o compute instance list -c "$TENANCY" --all --query 'data[?"lifecycle-state"!=`"TERMINATED"`].[id,"display-name"]' 2>/dev/null | jq -r '.[]|@tsv')
+  while IFS=$'\t' read -r id nm; do [ "$INTR" = 1 ] && { INTR=0; break; }; [ -z "$id" ] && continue; local s; s=$(o compute instance list-vnics --instance-id "$id" --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output 2>/dev/null); MAP[$s]="${MAP[$s]}$nm "; done <<< "$d"
+  local -a SUB_IDS=() SUB_NAMES=(); local i=0
+  while IFS=$'\t' read -r sname cidr sid; do
+    [ -z "$sid" ] && continue; i=$((i+1))
+    SUB_IDS[$i]="$sid"; SUB_NAMES[$i]="$sname"
+    printf "  %-3s %-22s %-15s [..%s] 承载：%s\n" "$i" "$sname" "$cidr" "${sid: -6}" "${MAP[$sid]:-（无实例）}"
+  done <<< "$subs"
+  echo
+  _ask -rp "删除空子网？输入编号删除，回车跳过: " idx
+  [ -z "$idx" ] && return
+  local delid="${SUB_IDS[$idx]}" delname="${SUB_NAMES[$idx]}"
+  [ -z "$delid" ] && { echo "$(_t "编号无效" "L_INVALID_NUM")"; return; }
+  [ -n "${MAP[$delid]}" ] && { echo "该子网仍有实例，不能删除"; return; }
+  _ask -rp "确认删除子网 $delname [..${delid: -6}]？(yes/n): " c; [ "$c" != yes ] && return
+  o network subnet delete --subnet-id "$delid" --force >/dev/null 2>&1 && echo "$(_t "已删除。" "L_DELETED")" || echo "删除失败（可能仍有其他资源占用，如VNIC/负载均衡/路由表）"
+}
+
+# ============ 引导卷 ============
+bv_get(){ pick_instance || return 1; BV_ID=$(o compute boot-volume-attachment list -c "$TENANCY" --availability-domain "$SEL_AD" --instance-id "$SEL_ID" --query 'data[0]."boot-volume-id"' --raw-output 2>/dev/null); [ -z "$BV_ID" ] && { echo "未找到引导卷"; return 1; }; return 0; }
+bv_list(){
+  bv_get || return
+  local info; info=$(o bv boot-volume get --boot-volume-id "$BV_ID" 2>/dev/null)
+  local nm sz vpu state
+  nm=$(echo "$info" | jq -r '.data."display-name" // "-"')
+  sz=$(echo "$info" | jq -r '.data."size-in-gbs" // "-"')
+  vpu=$(echo "$info" | jq -r '.data."vpus-per-gb" // "-"')
+  state=$(echo "$info" | jq -r '.data."lifecycle-state" // "-"')
+  local perf="平衡"; [ "$vpu" = 0 ] && perf="较低成本"; [ "$vpu" -ge 20 ] 2>/dev/null && perf="高性能"
+  echo "  名称：$nm"
+  echo "  大小：${sz}GB"
+  echo "  性能：VPU $vpu（$perf）"
+  echo "  状态：$state"
+  local dvn dvs dvi dlines="" total="$sz"
+  while IFS=$'\t' read -r dvn dvs dvi; do
+    [ -z "$dvs" ] && continue
+    [ -z "$dlines" ] && echo "  ── 挂载的数据盘 ──"
+    echo "  数据盘：$dvn  ${dvs}GB"
+    dlines="${dlines}数据盘：$dvn ${dvs}GB  
+"; total=$(( ${total:-0} + dvs ))
+  done < <(_inst_data_vols "$SEL_ID" "$SEL_AD")
+  [ -n "$dlines" ] && echo "  合计：${total}GB（引导卷 ${sz}GB + 数据盘）"
+  notify "引导卷" "$SEL_NAME" "大小：${sz}GB" "性能：VPU$vpu（$perf）" "状态：$state" ${dlines:+"$dlines合计：${total}GB"}
+}
+bv_expand(){
+  bv_get || return
+  local old; old=$(o bv boot-volume get --boot-volume-id "$BV_ID" --query 'data."size-in-gbs"' --raw-output 2>/dev/null)
+  local _hr="${HOME_REGION:-$OCI_REGION}"
+  if [ "$OCI_REGION" != "$_hr" ]; then
+    echo "$(_t "⚠️ 当前是副区域（%s），引导卷扩容全部计费，无免费额度" "L_BV_SUBREGION" "$OCI_REGION")"
+  fi
+  echo "$SEL_NAME 当前引导卷：${old}GB（只能扩不能缩；免费额度整账号合计200G，仅主区域）"
+  local sz; _askc "$(_t "扩容到 GB" "L_EXTEND_TO")" sz || return
+  _is_int "$sz" || { echo "必须是整数"; return; }
+  [ "$sz" -gt "$old" ] || { echo "必须大于当前 ${old}GB"; return; }
+  if [ "$sz" -gt 200 ]; then _ask -rp "$(_t "⚠️ %sGB 超过200G 会收费且无法缩回，确认输 yes: " "L_ASK_OVER200" "${sz}")" c; [ "$c" = yes ] || return; fi
+  _confirm "确认 $SEL_NAME 引导卷 ${old}GB → ${sz}GB？（不可逆）" || return
+  local out; out=$(o bv boot-volume update --boot-volume-id "$BV_ID" --size-in-gbs "$sz" 2>&1) || { echo "失败：$(_oci_err "$out")"; notify "引导卷扩容失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; return; }
+  sleep 5
+  local now; now=$(o bv boot-volume get --boot-volume-id "$BV_ID" --query 'data."size-in-gbs"' --raw-output 2>/dev/null)
+  if [ "$now" = "$sz" ]; then
+    echo "云端已扩至 ${now}GB。还需在节点机 $SEL_NAME 里扩分区（或重启实例自动扩）："
+    echo "  echo 1 | sudo tee /sys/class/block/sda/device/rescan"
+    echo "  sudo growpart /dev/sda 1"
+    echo "  sudo resize2fs /dev/sda1"
+    notify "引导卷扩容" "$SEL_NAME" "变更：${old}GB → ${now}GB" "状态：AVAILABLE（云端已扩容）" "提示：需在节点机扩分区或重启实例后生效"
+  else
+    echo "已提交但云端大小仍为 ${now}GB，稍后在引导卷查看确认。"
+    notify "引导卷扩容失败" "$SEL_NAME" "原因：提交后大小仍为 ${now}GB"
+  fi
+}
+bv_perf(){
+  bv_get || return
+  local old; old=$(o bv boot-volume get --boot-volume-id "$BV_ID" --query 'data."vpus-per-gb"' --raw-output 2>/dev/null)
+  echo "$SEL_NAME 当前 VPU：$old   可选：0=较低成本 10=平衡 20=较高性能（10的倍数，最高120）"
+  local vpu; _askc "VPU" vpu || return
+  _is_int "$vpu" && [ $((vpu % 10)) -eq 0 ] && [ "$vpu" -le 120 ] || { echo "$(_t "必须是 0-120 之间 10 的倍数" "L_VPU_RANGE")"; return; }
+  [ "$vpu" = "$old" ] && { echo "$(_t "与当前相同，无需修改。" "L_NO_CHANGE")"; return; }
+  [ "$vpu" -gt 10 ] && echo "$(_t "⚠️ VPU 高于10 会产生额外费用。" "L_VPU_COST_WARN")"
+  _confirm "确认 VPU $old → $vpu？" || return
+  local out; out=$(o bv boot-volume update --boot-volume-id "$BV_ID" --vpus-per-gb "$vpu" 2>&1) || { echo "失败：$(_oci_err "$out")"; notify "引导卷性能失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; return; }
+  sleep 5
+  local now; now=$(o bv boot-volume get --boot-volume-id "$BV_ID" --query 'data."vpus-per-gb"' --raw-output 2>/dev/null)
+  if [ "$now" = "$vpu" ]; then echo "$(_t "已生效：VPU %s" "L_VPU_DONE" "$now")"; notify "引导卷性能" "$SEL_NAME" "变更：VPU$old → VPU$now" "状态：已生效"
+  else echo "$(_t "已提交但当前仍为 VPU %s，稍后确认。" "L_VPU_PENDING" "$now")"; notify "引导卷性能失败" "$SEL_NAME" "原因：提交后仍为 VPU$now"; fi
+}
+bv_shrink(){ echo "缩硬盘：新建 47GB 引导卷替换，原数据不保留，需分离/挂回，风险高。"; echo "当前版本暂不自动执行，建议控制台 Cloud Shell 手动操作。"; }
+
+# ============ 流量/配额/成本 ============
+_fmt_bytes(){ awk -v b="$1" 'BEGIN{ if(b>=1073741824) printf "%.2f GB", b/1073741824; else printf "%.2f MB", b/1048576 }'; }
+traffic_stat(){
+  pick_instance || return
+  local vnic; vnic=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[0].id' --raw-output)
+  local start end; start=$(date -u +%Y-%m-01T00:00:00Z); end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  echo; echo "── 流量统计（$SEL_NAME，本月出站）──"
+  echo "$(_t "读取中..." "L_LOADING")"
+  local rows; rows=$(o monitoring metric-data summarize-metrics-data --namespace oci_vcn --compartment-id "$TENANCY" \
+    --query-text "VnicToNetworkBytes[1d]{resourceId = \"$vnic\"}.sum()" --start-time "$start" --end-time "$end" \
+    --query 'data[0]."aggregated-datapoints"[].[timestamp,value]' 2>/dev/null | jq -r '.[]|@tsv' 2>/dev/null)
+  [ -z "$rows" ] && { echo "$(_t "无数据" "L_NO_DATA")"; return; }
+  printf "%-12s %s\n" "日期" "出站"
+  local total=0
+  while IFS=$'\t' read -r ts val; do
+    [ -z "$ts" ] && continue
+    printf "%-12s %s\n" "${ts:0:10}" "$(_fmt_bytes "${val%.*}")"
+    total=$(( total + ${val%.*} ))
+  done <<< "$rows"
+  echo "────────────"
+  echo "本月总计：$(_fmt_bytes "$total")"
+  notify "流量统计" "$SEL_NAME" "本月出站总计：$(_fmt_bytes "$total")"
+}
+# 查某个计算额度在指定可用域的 已用/可用。输出 "已用<TAB>可用"，失败输出空
+_limit_avail(){ o limits resource-availability get --service-name compute --limit-name "$1" --compartment-id "$TENANCY" \
+  --availability-domain "$2" 2>/dev/null | jq -r '.data | "\(.used // 0)\t\(.available // "")"' 2>/dev/null; }
+quota_query(){
+  echo "$(_t "读取可用域与规格..." "L_READING_AD_SHAPE")"
+  local ads; ads=$(o iam availability-domain list --query 'data[].name' 2>/dev/null | jq -r '.[]' 2>/dev/null)
+  [ -z "$ads" ] && { echo "$(_t "读取可用域失败" "L_AD_FAIL")"; return; }
+  local ad u a push=""
+  printf "%-24s %-26s %s\n" "可用域" "AMD Micro（免费2台）" "ARM A1（免费4核/24G）"
+  while read -r ad; do
+    [ -z "$ad" ] && continue
+    local shapes c1 c2 uc ac um am
+    shapes=$(o compute shape list -c "$TENANCY" --availability-domain "$ad" --all --query 'data[].shape' 2>/dev/null | jq -r '.[]' 2>/dev/null)
+    # AMD
+    if [ -n "$shapes" ] && ! grep -qx 'VM.Standard.E2.1.Micro' <<< "$shapes"; then c1="❌ 本区域不提供"
+    else IFS=$'\t' read -r u a < <(_limit_avail standard-e2-micro-core-count "$ad")
+         [ -n "$a" ] && c1="已用${u%.*}台 剩${a%.*}台" || c1="查询失败"; fi
+    # ARM
+    if [ -n "$shapes" ] && ! grep -qx 'VM.Standard.A1.Flex' <<< "$shapes"; then c2="❌ 本区域不提供"
+    else IFS=$'\t' read -r uc ac < <(_limit_avail standard-a1-core-count "$ad")
+         IFS=$'\t' read -r um am < <(_limit_avail standard-a1-memory-count "$ad")
+         if [ -n "$ac" ]; then
+           local fc=$((4-${uc%.*})) fm=$((24-${um%.*})); [ $fc -lt 0 ] && fc=0; [ $fm -lt 0 ] && fm=0
+           c2="已用${uc%.*}核/${um%.*}G，免费剩${fc}核/${fm}G（含付费还能开 ${ac%.*}核）"
+         else c2="查询失败"; fi; fi
+    printf "%-24s %-26s %s\n" "${ad##*:}" "$c1" "$c2"
+    push="${push}${ad##*:}  
+AMD：$c1  
+ARM：$c2  
+"
+  done <<< "$ads"
+  echo "$(_t "（免费额度按整个租户计算；超出免费部分按量收费）" "L_FREE_TIER_NOTE")"
+  dingtalk_push "配额查询" "📈 配额查询
+
+账号：${ACC_NAME}
+
+区域：${OCI_REGION}
+
+${push}
+时间：$(bj_time)"
+}
+_cost_query(){  # $1=start $2=end $3=granularity $4=groupby $5=范围描述(用于钉钉)
+  local hr="${HOME_REGION:-$OCI_REGION}" gb=""
+  [ -n "$4" ] && gb="--group-by [\"$4\"]"
+  local out
+  out=$(oci --config-file "$OCI_CFG" --region "$hr" usage-api usage-summary request-summarized-usages \
+    --tenant-id "$TENANCY" --time-usage-started "$1" --time-usage-ended "$2" \
+    --granularity "$3" --query-type COST $gb 2>/dev/null)
+  [ -z "$out" ] && { echo "$(_t "无数据" "L_NO_DATA")"; return; }
+  # 明细行（键 值 币种），第一列日期或服务名
+  local rows
+  rows=$(echo "$out" | jq -r '
+    [.data.items[] | {
+      k:(if .service then .service else (."time-usage-started"[5:10]) end),
+      a:((."computed-amount"//0)*100|floor/100),
+      c:.currency }]
+    | sort_by(.k)
+    | .[] | [.k, (.a|tostring), .c] | @tsv' 2>/dev/null)
+  # 终端显示
+  printf "%-22s %12s %s\n" "项目/日期" "金额" "币种"
+  echo "$rows" | awk -F'\t' '{printf "%-22s %12s %s\n",$1,$2,$3; sum+=$2; cur=$3} END{if(NR)printf "%-22s %12s %s\n","合计",(int(sum*100)/100),cur}'
+  # 钉钉推送（明细+合计）；每行末尾补两空格实现 markdown 换行
+  local detail total
+  detail=$(echo "$rows" | awk -F'\t' '{printf "  %s  %s %s  \n",$1,$2,$3; sum+=$2; cur=$3} END{printf "@@%.2f %s",sum,cur}')
+  total="${detail##*@@}"; detail="${detail%@@*}"
+  local ts; ts=$(bj_time)
+  local md="💰 账单查询
+
+账号：${ACC_NAME:-—}
+
+区域：${OCI_REGION:-—}
+
+范围：${5:-—}
+
+**明细：**
+${detail}
+**合计：${total}**
+
+时间：${ts}"
+  dingtalk_push "账单查询" "$md"
+}
+# 本月账单：按服务 + 按日 合并一条
+_cost_month(){
+  local hr="${HOME_REGION:-$OCI_REGION}"
+  local s e; s=$(date -u +%Y-%m-01T00:00:00Z); e=$(date -u +%Y-%m-%dT00:00:00Z)
+  echo "$(_t "读取中..." "L_LOADING")"
+  # 按服务
+  local svc_out; svc_out=$(oci --config-file "$OCI_CFG" --region "$hr" usage-api usage-summary request-summarized-usages \
+    --tenant-id "$TENANCY" --time-usage-started "$s" --time-usage-ended "$e" --granularity MONTHLY --query-type COST --group-by '["service"]' 2>/dev/null)
+  # 按日
+  local day_out; day_out=$(oci --config-file "$OCI_CFG" --region "$hr" usage-api usage-summary request-summarized-usages \
+    --tenant-id "$TENANCY" --time-usage-started "$s" --time-usage-ended "$e" --granularity DAILY --query-type COST 2>/dev/null)
+  [ -z "$svc_out" ] && { echo "$(_t "无数据" "L_NO_DATA")"; return; }
+  local svc day total cur
+  svc=$(echo "$svc_out" | jq -r '[.data.items[]|{k:.service,a:((."computed-amount"//0)*100|floor/100),c:.currency}]|sort_by(.k)|.[]|"  \(.k)  \(.a) \(.c)"' 2>/dev/null)
+  day=$(echo "$day_out" | jq -r '[.data.items[]|{k:(."time-usage-started"[5:10]),a:((."computed-amount"//0)*100|floor/100),c:.currency}]|sort_by(.k)|.[]|"  \(.k)  \(.a) \(.c)"' 2>/dev/null)
+  # 钉钉 markdown 换行：每行末尾补两个空格
+  local svc_md day_md
+  svc_md=$(echo "$svc" | sed 's/$/  /')
+  day_md=$(echo "$day" | sed 's/$/  /')
+  total=$(echo "$svc_out" | jq -r '[.data.items[].["computed-amount"//0]]|add|(.*100|floor)/100' 2>/dev/null)
+  cur=$(echo "$svc_out" | jq -r '.data.items[0].currency' 2>/dev/null)
+  # 终端显示
+  echo; echo "$(_t "按服务：" "L_BY_SERVICE")"; echo "$svc"
+  echo "$(_t "按日：" "L_BY_DAY")"; echo "$day"
+  echo "合计：$total $cur"
+  # 钉钉
+  local ts; ts=$(bj_time)
+  local md="💰 本月账单
+
+账号：${ACC_NAME:-—}
+
+区域：${OCI_REGION:-—}
+
+**按服务：**
+${svc_md}
+
+**按日：**
+${day_md}
+
+**合计：${total} ${cur}**
+
+时间：${ts}"
+  dingtalk_push "本月账单" "$md"
+}
+cost_analysis(){
+  while true; do
+    echo; echo "── 成本分析（主区域 ${HOME_REGION} 查询）──"
+    echo " 1 本月账单（服务+按日）   2 自定义区间"
+    echo " 3 设置预算告警   4 设置本账号邮箱   0 返回"
+    _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" c
+    local s e
+    case "$c" in
+      1) _cost_month; pause;;
+      2) _ask -rp "起始日期(YYYY-MM-DD): " sd; _ask -rp "结束日期(YYYY-MM-DD): " ed
+         _ask -rp "粒度 1=按天 2=按月: " g
+         local gran=DAILY gb=""; [ "$g" = 2 ] && { gran=MONTHLY; gb=service; }
+         _cost_query "${sd}T00:00:00Z" "${ed}T00:00:00Z" "$gran" "$gb" "自定义 ${sd}~${ed}"; pause;;
+      3) budget_alert; pause;;
+      4) set_account_email; pause;;
+      0) return;;
+    esac
+  done
+}
+set_account_email(){
+  local ef="$EMAIL_DIR/$ACC_NAME"
+  local cur; cur=$(cat "$ef" 2>/dev/null)
+  echo "$(_t "账号 %s" "L_ACCOUNT_X" "$ACC_NAME")"
+  [ -n "$cur" ] && echo "$(_t "当前告警邮箱：%s" "L_CURR_EMAIL" "$cur")"
+  _ask -rp "$(_t "输入邮箱（回车不变）: " "L_ASK_EMAIL")" em
+  [ -z "$em" ] && return
+  echo "$em" > "$ef"; chmod 600 "$ef"
+  echo "$(_t "已保存：%s" "L_SAVED_X" "$em")"
+}
+# 设置整租户月度预算 + 50/80/100 三档告警邮件
+budget_alert(){
+  local ef="$EMAIL_DIR/$ACC_NAME"
+  local email; email=$(cat "$ef" 2>/dev/null)
+  [ -z "$email" ] && { echo "本账号($ACC_NAME)还没设告警邮箱，请先在成本分析里选「设置本账号邮箱」"; return; }
+  echo "本账号告警邮箱：$email"
+  local hr="${HOME_REGION:-$OCI_REGION}"
+  local O="oci --config-file $OCI_CFG --region $hr"
+  # 先查已有预算
+  echo "$(_t "查询已有预算..." "L_QUERY_BUDGET")"
+  local existing; existing=$($O budgets budget budget list -c "$TENANCY" --all \
+    --query 'data[].[id,"display-name",amount,"reset-period"]' 2>/dev/null | jq -r '.[]|@tsv' 2>/dev/null)
+  if [ -n "$existing" ]; then
+    echo "$(_t "已存在预算：" "L_BUDGET_EXISTS")"
+    local -a BIDS=(); local n=0
+    while IFS=$'\t' read -r bid bname bamt bperiod; do
+      [ -z "$bid" ] && continue; n=$((n+1)); BIDS[$n]="$bid"
+      # 列出该预算的告警档位
+      local rules; rules=$($O budgets budget alert-rule list --budget-id "$bid" --all \
+        --query 'data[].threshold' 2>/dev/null | jq -r 'map(floor)|unique|sort|join("/")' 2>/dev/null)
+      printf "  %s  金额 %s  周期 %s  告警 %s%%\n" "$n" "$bamt" "$bperiod" "${rules:-无}"
+    done <<< "$existing"
+    echo
+    echo "$(_t "该租户已有预算。选择操作：" "L_BUDGET_CHOOSE")"
+    echo " 1 保持不动   2 删除全部重建   0 取消"
+    _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" op
+    case "$op" in
+      1) echo "保持不动。"; return;;
+      2) local k; for k in $(seq 1 $n); do
+           $O budgets budget budget delete --budget-id "${BIDS[$k]}" --force >/dev/null 2>&1 && echo "  已删除预算 $k"
+         done;;
+      *) return;;
+    esac
+  fi
+  # 新建
+  _ask -rp "月度预算金额（整租户，如 5）: " amount
+  [ -z "$amount" ] && return
+  echo "$(_t "创建预算中..." "L_CREATING_BUDGET")"
+  local bid; bid=$($O budgets budget budget create \
+    --compartment-id "$TENANCY" --amount "$amount" --reset-period MONTHLY \
+    --target-type COMPARTMENT --targets "[\"$TENANCY\"]" \
+    --display-name "oci-cn-budget" \
+    --query 'data.id' --raw-output 2>&1)
+  if [[ "$bid" != ocid1.budget* ]]; then
+    echo "$(_t "创建预算失败：" "L_BUDGET_FAIL")"; echo "$bid" | tail -3; return
+  fi
+  echo "$(_t "预算已建。设置告警档位..." "L_BUDGET_DONE")"
+  local p
+  for p in 50 80 100; do
+    $O budgets budget alert-rule create \
+      --budget-id "$bid" --type ACTUAL --threshold "$p" --threshold-type PERCENTAGE \
+      --recipients "$email" --display-name "alert-$p" \
+      --message "预算已使用 $p%" >/dev/null 2>&1 && echo "  ✓ $p% 告警已设" || echo "  ✗ $p% 告警失败"
+  done
+  echo "$(_t "完成。达到 50/80/100%% 会发邮件到 %s" "L_BUDGET_ALERT_DONE" "$email")"
+}
+
+# ============ 账号页 ============
+account_page(){
+  local row="$1"; ACC_NAME=$(echo "$row" | cut -f1)
+  TENANCY=$(echo "$row" | cut -f2); local home; home=$(echo "$row" | cut -f5); [ "$home" = - ] && home=""; HOME_REGION="$home"
+  choose_region "$ACC_NAME" "$TENANCY" "$home" || { pause; return; }
+  OCI_CFG=$(oci_cfg "$ACC_NAME" "$OCI_REGION")
+  while true; do
+    local hrcn; hrcn=$(region_cn "$HOME_REGION")
+    echo; line
+    echo "账号：$ACC_NAME    区域：$OCI_REGION $(region_cn "$OCI_REGION")"
+    echo "主区域：$HOME_REGION $hrcn"
+    line
+    echo " $(_t "1 租户详情" "L_MENU_TENANT")   $(_t "2 实例详情" "L_MENU_INSTANCE")   $(_t "3 引导卷" "L_MENU_VOLUME")"
+    echo " $(_t "4 虚拟云网络" "L_MENU_NETWORK") $(_t "5 流量统计" "L_MENU_TRAFFIC")   $(_t "6 配额查询" "L_MENU_QUOTA")"
+    echo " $(_t "7 成本分析" "L_MENU_COST")   $(_t "9 切换区域" "L_MENU_SWITCH_REGION")   $(_t "0 返回" "L_MENU_BACK")"
+    _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" t
+    case "$t" in
+      1) tenant_detail; pause;;
+      2) inst_menu;; 3) bv_menu;; 4) net_menu;;
+      5) traffic_stat; pause;; 6) quota_query; pause;; 7) cost_analysis;;
+      9) choose_region "$ACC_NAME" "$TENANCY" "$HOME_REGION" && OCI_CFG=$(oci_cfg "$ACC_NAME" "$OCI_REGION");;
+      0) return;;
+    esac
+  done
+}
+# 时间格式化：转用户配置时区（默认北京时间），可选附带已过天数
+_fmt_time(){ [ -z "$1" ] || [ "$1" = null ] && { echo "-"; return; }; local d; d=$(TZ=$(get_tz) date -d "$1" '+%Y-%m-%d %H:%M' 2>/dev/null) || { echo "$1"; return; }
+  if [ "$2" = days ]; then local n=$(( ( $(date +%s) - $(date -d "$1" +%s) ) / 86400 )); echo "$d（已 ${n} 天）"; else echo "$d"; fi; }
+tenant_detail(){
+  echo "$(_t "读取租户信息..." "L_READING_TENANT")"
+  local hr="${HOME_REGION:-$OCI_REGION}" cfg; cfg=$(oci_cfg "$ACC_NAME" "$hr")
+  local info; info=$(oci --config-file "$cfg" --region "$hr" iam tenancy get --tenancy-id "$TENANCY" 2>/dev/null)
+  [ -z "$info" ] && { echo "$(_t "读取失败" "L_READ_FAIL")"; return; }
+  local tname desc
+  tname=$(echo "$info" | jq -r '.data.name // "-"')
+  desc=$(echo "$info" | jq -r '.data.description // "-"')
+  # 建立时间：租户即根区间，查根区间的 time-created
+  local tcreated; tcreated=$(oci --config-file "$cfg" --region "$hr" iam compartment get --compartment-id "$TENANCY" \
+    --query 'data."time-created"' --raw-output 2>/dev/null)
+  # 套餐与升级时间：实时查订阅（主区域端点）
+  local sub plan tup
+  sub=$(oci --config-file "$cfg" --region "$hr" osp-gateway subscription-service subscription list --compartment-id "$TENANCY" \
+    --osp-home-region "$hr" 2>/dev/null)
+  plan=$(echo "$sub" | jq -r '(.data.items[0] // .data[0])."plan-type" // empty' 2>/dev/null)
+  tup=$(echo "$sub" | jq -r '(.data.items[0] // .data[0])."time-plan-upgrade" // empty' 2>/dev/null)
+  # 已订阅区域：主区域排前
+  local regs; regs=$(oci --config-file "$cfg" --region "$hr" iam region-subscription list --tenancy-id "$TENANCY" 2>/dev/null \
+    | jq -r '.data | sort_by(."is-home-region"|not) | .[]."region-name"' 2>/dev/null)
+  local rcnt=0 rlist="" r
+  while read -r r; do [ -z "$r" ] && continue; rcnt=$((rcnt+1)); rlist="${rlist}${rlist:+、}$r $(region_cn "$r")"; done <<< "$regs"
+  echo "  租户名称：$tname"
+  echo "  描述：$desc"
+  echo "  套餐：${plan:-查询失败}"
+  echo "  建立时间：$(_fmt_time "$tcreated" days)"
+  [ "$plan" = PAYG ] && [ -n "$tup" ] && echo "  升级PAYG：$(_fmt_time "$tup")"
+  echo "  主区域：$hr $(region_cn "$hr")"
+  echo "  已订阅区域（$rcnt/3）：${rlist:--}"
+  echo "  租户OCID：$TENANCY"
+  echo
+  echo " 1 订阅新区域（开通副区域）   0 返回"
+  _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" d
+  [ "$d" = 1 ] && subscribe_region
+}
+# 订阅新区域（不可逆）。必须在主区域调用
+subscribe_region(){
+  local hr="${HOME_REGION:-$OCI_REGION}"
+  echo "$(_t "读取区域列表..." "L_READING_REGIONS")"
+  # 全部区域
+  local all; all=$(o --region "$hr" iam region list --query 'data[].name' --raw-output 2>/dev/null | jq -r '.[]?' 2>/dev/null)
+  [ -z "$all" ] && all=$(o --region "$hr" iam region list 2>/dev/null | jq -r '.data[].name' 2>/dev/null)
+  [ -z "$all" ] && { echo "读取区域失败"; return; }
+  # 已订阅
+  local subbed; subbed=$(o --region "$hr" iam region-subscription list --tenancy-id "$TENANCY" 2>/dev/null | jq -r '.data[]."region-name"' 2>/dev/null)
+  echo "── 可订阅区域（★=已订阅）──"
+  local i=0; local -a keys
+  while read -r r; do
+    [ -z "$r" ] && continue
+    i=$((i+1)); keys[$i]="$r"
+    local mark="  "; echo "$subbed" | grep -qx "$r" && mark="★ "
+    printf " %2d %s%-22s %s\n" "$i" "$mark" "$r" "$(region_cn "$r")"
+  done <<< "$all"
+  echo
+  echo "⚠️ 订阅不可逆：开通后永久保留，无法取消订阅。"
+  _ask -rp "$(_t "输入要订阅的区域编号（0取消）: " "L_ASK_SUB_REGION")" n
+  [ "$n" = 0 ] || [ -z "$n" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  local target="${keys[$n]}"
+  [ -z "$target" ] && { echo "$(_t "编号无效" "L_INVALID_NUM")"; return; }
+  if echo "$subbed" | grep -qx "$target"; then echo "该区域已订阅，无需重复。"; return; fi
+  echo "将订阅：$target $(region_cn "$target")"
+  _ask -rp "确认订阅？不可逆！(输 yes 确认): " c
+  [ "$c" = yes ] || { echo "$(_t "取消" "L_CANCEL")"; return; }
+  # region-key：取该区域的 key
+  local rkey; rkey=$(o --region "$hr" iam region list --query "data[?name=='$target'].key | [0]" --raw-output 2>/dev/null)
+  [ -z "$rkey" ] || [ "$rkey" = null ] && { echo "取不到区域key"; return; }
+  local out; out=$(o --region "$hr" iam region-subscription create --region-key "$rkey" --tenancy-id "$TENANCY" 2>&1)
+  if echo "$out" | grep -q '"region-name"'; then
+    echo "订阅成功：$target $(region_cn "$target")"
+    local ts; ts=$(bj_time)
+    dingtalk_push "订阅新区域" "📢 订阅新区域
+
+账号：${ACC_NAME}
+
+当前区域：${OCI_REGION}
+
+订阅区域：$target $(region_cn "$target")
+
+状态：$(echo "$out" | jq -r '.data.status // "已提交"' 2>/dev/null)
+
+时间：${ts}"
+  else
+    echo "订阅失败："; echo "$out" | tail -3
+    local ts; ts=$(bj_time)
+    dingtalk_push "订阅区域失败" "❌ 订阅区域失败
+
+账号：${ACC_NAME}
+
+当前区域：${OCI_REGION}
+
+订阅区域：$target $(region_cn "$target")
+
+时间：${ts}"
+  fi
+}
+inst_test_push(){ pick_instance || return; notify "测试" "$SEL_NAME" "仅测试，未改动任何资源"; echo "已推送测试通知，看钉钉群模板。"; pause; }
+# 串行控制台救砖：SSH 连不上时，通过控制台进系统改公钥
+inst_console(){
+  pick_instance || return
+  echo "串行控制台救砖（用于 SSH 连不上时进系统）"
+  echo "先贴一个临时公钥（用于认证控制台连接本身，建议用面板机的 ~/.ssh/id_ed25519.pub）："
+  echo "粘贴公钥（ssh-ed25519... 或 ssh-rsa...）："
+  _ask -r pubkey
+  [[ "$pubkey" == ssh-* ]] || { echo "$(_t "不是有效公钥" "L_INVALID_PUBKEY")"; return; }
+  local kf="$RUN_DIR/console.pub"; echo "$pubkey" > "$kf"
+  # 先看有没有已存在的控制台连接，有则复用
+  local cid
+  cid=$(o compute instance-console-connection list -c "$TENANCY" --instance-id "$SEL_ID" \
+    --query 'data[?"lifecycle-state"==`"ACTIVE"`].id|[0]' --raw-output 2>/dev/null)
+  if [ -z "$cid" ] || [ "$cid" = null ]; then
+    echo "创建控制台连接中..."
+    cid=$(o compute instance-console-connection create --instance-id "$SEL_ID" --ssh-public-key-file "$kf" \
+      --query 'data.id' --raw-output 2>&1 | tail -1)
+    [[ "$cid" == ocid1.instanceconsoleconnection* ]] || { echo "创建失败："; echo "$cid"|tail -3; return; }
+    echo "等待连接就绪..."; sleep 6
+  else
+    echo "已有活动的控制台连接，直接复用。"
+  fi
+  local conn
+  conn=$(o compute instance-console-connection get --instance-console-connection-id "$cid" \
+    --query 'data."connection-string"' --raw-output 2>/dev/null)
+  echo; line
+  echo "串行控制台连接命令（在面板机执行，用刚才那个公钥对应的私钥）："
+  echo
+  echo "$conn"
+  echo
+  line
+  cat <<'EOF'
+进入控制台后改实例公钥的步骤：
+1. 执行上面的连接命令，回车后会黑屏，再敲一次回车出现登录/引导。
+2. 重启实例（在另一个终端用本工具 重启），控制台会显示开机过程。
+3. 开机时在 GRUB 菜单按 e，编辑内核行，末尾加  init=/bin/bash  按 Ctrl+X 进入。
+4. 进单用户后执行：
+     mount -o remount,rw /
+     # Ubuntu 默认用户 ubuntu，Oracle Linux 用 opc
+     su - ubuntu   （或直接编辑对应家目录）
+     echo "你的新公钥" >> /home/ubuntu/.ssh/authorized_keys
+     chmod 600 /home/ubuntu/.ssh/authorized_keys
+     chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+     sync; exec /sbin/init
+5. 系统正常启动后，用新私钥 SSH 即可登录。
+提示：不同镜像默认用户名不同（Ubuntu=ubuntu，OL=opc，Debian=debian）。
+EOF
+  line
+  _ask -rp "用完是否删除此控制台连接？(y/n): " d
+  [ "$d" = y ] && { o compute instance-console-connection delete --instance-console-connection-id "$cid" --force >/dev/null 2>&1 && echo "已删除控制台连接。"; }
+  notify "串行控制台" "$SEL_NAME" "已创建控制台连接用于救砖" "状态：$(o compute instance-console-connection get --instance-console-connection-id "$cid" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)"
+  pause
+}
+# ============ 自定义镜像：从实例创建 / 删除 ============
+inst_create_image(){
+  pick_instance || return
+  local st; st=$(_inst_state "$SEL_ID")
+  echo "$(_t "实例：${SEL_NAME}（${st}）" "L_IMG_INST" "$SEL_NAME" "$st")"
+  if [ "$st" != "STOPPED" ]; then
+    echo "$(_t "为保证镜像数据一致，建议先关机再创建。运行中创建也可以，但有极小概率文件不一致。" "L_IMG_WARN_RUNNING")"
+    local sh; _ask -rp "$(_t "是否先关机？(y=关机后创建/n=直接创建) [n]: " "L_IMG_ASK_STOP")" sh; sh="${sh:-n}"
+    if [ "$sh" = "y" ] || [ "$sh" = "Y" ]; then
+      echo "$(_t "关机中..." "L_STOPPING")"
+      o compute instance action --instance-id "$SEL_ID" --action SOFTSTOP >/dev/null 2>&1
+      local t=0 s=""
+      while [ "$t" -lt 300 ]; do
+        s=$(_inst_state "$SEL_ID"); [ "$s" = "STOPPED" ] && break
+        printf "."; sleep 10; t=$((t+10))
+      done
+      echo
+      [ "$s" != "STOPPED" ] && { echo "$(_t "关机超时，取消创建。" "L_IMG_STOP_TIMEOUT")"; return; }
+    fi
+  fi
+  local d; d=$(date +%Y%m%d)
+  local iname; _ask -rp "$(_t "镜像名" "L_IMG_NAME") [${SEL_NAME}-image-${d}]: " iname; iname="${iname:-${SEL_NAME}-image-${d}}"
+  _confirm "$(_t "确认为实例 ${SEL_NAME} 创建自定义镜像 ${iname}？" "L_IMG_CONFIRM" "$SEL_NAME" "$iname")" || return
+  echo "$(_t "创建中..." "L_CREATING")"
+  local imgid; imgid=$(o compute image create -c "$TENANCY" --instance-id "$SEL_ID" --display-name "$iname" --query "data.id" --raw-output 2>&1)
+  if [[ "$imgid" != ocid1.image* ]]; then echo "$(_t "失败：" "L_FAILED")$(_oci_err "$imgid")"; return; fi
+  echo "$(_t "已提交，等待镜像可用（最多10分钟）..." "L_IMG_WAIT")"
+  local t=0 ist=""
+  while [ "$t" -lt 600 ]; do
+    ist=$(o compute image get --image-id "$imgid" --query "data.\"lifecycle-state\"" --raw-output 2>/dev/null)
+    [ "$ist" = "AVAILABLE" ] && break
+    [ "$ist" = "FAILED" ] && break
+    printf "."; sleep 10; t=$((t+10))
+  done
+  echo
+  if [ "$ist" = "AVAILABLE" ]; then
+    echo "$(_t "镜像创建完成：${iname}" "L_IMG_DONE" "$iname")"
+  else
+    echo "$(_t "镜像状态：${ist}（可在控制台查看详情）" "L_IMG_STATE" "$ist")"
+  fi
+}
+image_delete(){
+  echo "$(_t "读取镜像列表..." "L_IMG_READING")"
+  local imgs; imgs=$(o compute image list -c "$TENANCY" 2>/dev/null | jq -r '.data[]|[."display-name",."id"]|@tsv' 2>/dev/null)
+  [ -z "$imgs" ] && { echo "$(_t "无可用镜像" "L_NO_IMAGES")"; return; }
+  local -a IMG_IDS=() IMG_NAMES=(); local i=0 nm id
+  while IFS=$'\t' read -r nm id; do
+    [ -z "$id" ] && continue; i=$((i+1)); IMG_IDS[$i]="$id"; IMG_NAMES[$i]="$nm"
+    printf "  %-3s %s\n" "$i" "$nm"
+  done <<< "$imgs"
+  echo "$(_t "注意：官方系统镜像请勿删除，只删你自己创建的。" "L_IMG_DEL_WARN")"
+  local ii; _askc "$(_t "选择要删除的镜像编号" "L_IMG_CHOOSE_DEL")" ii || return
+  local delid="${IMG_IDS[$ii]}" delnm="${IMG_NAMES[$ii]}"
+  [ -z "$delid" ] && { echo "$(_t "无效" "L_INVALID")"; return; }
+  local c; _ask -rp "$(_t "确认永久删除镜像 ${delnm}？输 yes 确认: " "L_IMG_ASK_DEL" "$delnm")" c; [ "$c" != yes ] && return
+  o compute image delete --image-id "$delid" --force >/dev/null 2>&1 \
+    && echo "$(_t "已删除。" "L_DELETED")" \
+    || echo "$(_t "删除失败。" "L_DEL_FAILED")"
+}
+inst_menu(){ while true; do echo; echo "$(_t "── 实例详情 ──" "L_INST_TITLE")"; echo " $(_t "1列表" "L_INST_LIST") $(_t "2开机" "L_INST_START") $(_t "3关机" "L_INST_STOP") $(_t "4强制关机" "L_INST_FORCE_STOP") $(_t "5重启" "L_INST_REBOOT")"; echo " $(_t "6改配置" "L_INST_RESIZE") $(_t "7创建" "L_INST_CREATE") $(_t "8删除" "L_INST_DELETE") $(_t "9改名" "L_INST_RENAME") $(_t "10换IP" "L_INST_CHANGE_IP") $(_t "11附IPv6" "L_INST_IPV6") $(_t "12测试推送" "L_INST_TEST_PUSH") $(_t "13创建镜像" "L_INST_CREATE_IMAGE") $(_t "14删除镜像" "L_INST_DELETE_IMAGE") $(_t "0返回" "L_MENU_BACK")"; _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x; case "$x" in 1)inst_list;pause;; 2)inst_action START 开机;; 3)inst_action SOFTSTOP 关机;; 4)inst_action STOP 强制关机;; 5)inst_action SOFTRESET 重启;; 6)inst_change_shape;; 7)inst_create;pause;; 8)inst_delete;; 9)inst_rename;; 10)inst_change_ip;pause;; 11)inst_ipv6;pause;; 12)inst_test_push;; 13)inst_create_image;pause;; 14)image_delete;pause;; 0)return;; esac; done; }
+# ============ 存储：全部盘 / 新建块存储卷 / 删除未挂载盘 ============
+# 账号级推送（无实例字段）。$1=图标 $2=标题 其余=字段行
+_push_acct(){ local icon="$1" title="$2"; shift 2; local md="${icon} ${title}
+
+账号：${ACC_NAME}" l; for l in "$@"; do md="${md}
+
+${l}"; done; md="${md}
+
+时间：$(bj_time)"; dingtalk_push "$title" "$md"; }
+# 在指定区域执行 oci：$1=区域 其余=参数
+_oc(){ local r="$1"; shift; oci --config-file "$(oci_cfg "$ACC_NAME" "$r")" --region "$r" "$@"; }
+# 扫描一个区域所有盘，输出：类型 TAB id TAB 名称 TAB 大小 TAB VPU TAB 挂载实例名(空=未挂载)
+_scan_region_disks(){
+  local r="$1" ads ad
+  ads=$(_oc "$r" iam availability-domain list --query 'data[].name' 2>/dev/null | jq -r '.[]' 2>/dev/null)
+  declare -A ATT INAME
+  local id nm
+  while IFS=$'\t' read -r id nm; do [ -n "$id" ] && INAME[$id]="$nm"; done < <(_oc "$r" compute instance list -c "$TENANCY" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"!="TERMINATED")|[.id,."display-name"]|@tsv' 2>/dev/null)
+  while IFS=$'\t' read -r id nm; do [ -n "$id" ] && ATT[$id]="${INAME[$nm]:-$nm}"; done < <(_oc "$r" compute volume-attachment list -c "$TENANCY" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"=="ATTACHED")|[."volume-id",."instance-id"]|@tsv' 2>/dev/null)
+  while read -r ad; do
+    [ -z "$ad" ] && continue
+    while IFS=$'\t' read -r id nm; do [ -n "$id" ] && ATT[$id]="${INAME[$nm]:-$nm}"; done < <(_oc "$r" compute boot-volume-attachment list -c "$TENANCY" --availability-domain "$ad" --all 2>/dev/null \
+      | jq -r '.data[]|select(."lifecycle-state"=="ATTACHED")|[."boot-volume-id",."instance-id"]|@tsv' 2>/dev/null)
+    _oc "$r" bv boot-volume list -c "$TENANCY" --availability-domain "$ad" --all 2>/dev/null \
+      | jq -r '.data[]|select(."lifecycle-state"=="AVAILABLE")|[.id,."display-name",(."size-in-gbs"|tostring),(."vpus-per-gb"|tostring)]|@tsv' 2>/dev/null \
+      | while IFS=$'\t' read -r id nm sz vp; do printf '引导卷\t%s\t%s\t%s\t%s\t%s\n' "$id" "$nm" "$sz" "$vp" "${ATT[$id]}"; done
+    _oc "$r" bv volume list -c "$TENANCY" --availability-domain "$ad" --all 2>/dev/null \
+      | jq -r '.data[]|select(."lifecycle-state"=="AVAILABLE")|[.id,."display-name",(."size-in-gbs"|tostring),(."vpus-per-gb"|tostring)]|@tsv' 2>/dev/null \
+      | while IFS=$'\t' read -r id nm sz vp; do printf '块存储\t%s\t%s\t%s\t%s\t%s\n' "$id" "$nm" "$sz" "$vp" "${ATT[$id]}"; done
+  done <<< "$ads"
+}
+# 全部盘。$1=only_free 时只登记未挂载的盘（供删除用）
+disk_scan_all(){
+  local hr="${HOME_REGION:-$OCI_REGION}"
+  echo "扫描所有已订阅区域的盘（需要一点时间）..."
+  local regs; regs=$(_oc "$hr" iam region-subscription list --tenancy-id "$TENANCY" 2>/dev/null | jq -r '.data[]."region-name"' 2>/dev/null)
+  DISK_ID=(); DISK_TYPE=(); DISK_REG=(); DISK_NM=(); DISK_SZ=()
+  local i=0 hsum=0 osum=0 fsum=0 fcnt=0 r t id nm sz vp att tag st plines=""
+  local -a _pline_arr=() _pline_main_block=()
+  local _pi=0 _nblock=0
+  printf "%-4s %-20s %-6s %-26s %-6s %-4s %s\n" "编号" "区域" "类型" "名称" "大小" "VPU" "挂载到 / 状态"
+  while read -r r; do
+    [ -z "$r" ] && continue
+    [ "$r" = "$hr" ] && tag="主" || tag="副"
+    while IFS=$'\t' read -r t id nm sz vp att; do
+      [ -z "$id" ] && continue
+      st="${att:-⚠️ 未挂载}"; [ "$tag" = 副 ] && [ -n "$att" ] && st="$att（副区域计费）"
+      [ "$tag" = 主 ] && hsum=$((hsum+sz)) || osum=$((osum+sz))
+      [ -z "$att" ] && { fsum=$((fsum+sz)); fcnt=$((fcnt+1)); }
+      if [ "$1" = only_free ] && [ -n "$att" ]; then continue; fi
+      i=$((i+1)); DISK_ID[$i]="$id"; DISK_TYPE[$i]="$t"; DISK_REG[$i]="$r"; DISK_NM[$i]="$nm"; DISK_SZ[$i]="$sz"
+      printf "%-4s %-20s %-6s %-26s %-6s %-4s %s\n" "$i" "$r($tag)" "$t" "${nm:0:26}" "${sz}G" "$vp" "$st"
+      _pline_arr[$_pi]="${r}(${tag}) ${t} ${nm} ${sz}G → ${st}"
+      if [ "$tag" = 主 ] && [ "$t" = 块存储 ]; then _pline_main_block[$_pi]=1; _nblock=$((_nblock+1)); else _pline_main_block[$_pi]=0; fi
+      _pi=$((_pi+1))
+    done < <(_scan_region_disks "$r")
+  done <<< "$regs"
+  line
+  local hflag=""; [ "$hsum" -gt 200 ] && hflag="  ⚠️ 超出 $((hsum-200))G 计费"
+  local _exceed=0; [ "$hsum" -gt 200 ] && _exceed=$((hsum-200))
+  local _j _mark
+  for _j in $(seq 0 $((_pi-1)) 2>/dev/null); do
+    _mark=""
+    if [ "$_exceed" -gt 0 ] && [ "${_pline_main_block[$_j]}" = 1 ]; then
+      if [ "$_nblock" -eq 1 ]; then
+        _mark="$(_t "（其中%sG超出免费限额会被计费）" "L_EXCEED_FREE" "$_exceed")"
+      else
+        _mark="$(_t "（部分超出免费限额会被计费）" "L_EXCEED_PART")"
+      fi
+    fi
+    plines="${plines}${_pline_arr[$_j]}${_mark}  
+"
+  done
+  echo "主区域合计：${hsum}G / 免费 200G${hflag}"
+  echo "副区域合计：${osum}G（不在免费额度内）"
+  echo "$(_t "未挂载：%s 个，共 %sG" "L_UNATTACHED_SUM" "${fcnt}" "${fsum}")"
+  DISK_COUNT=$i
+  [ "$1" = only_free ] || _push_acct "💽" "全部盘" "${plines}" "主区域：${hsum}G / 免费200G${hflag}" "副区域：${osum}G（计费）" "未挂载：${fcnt} 个 ${fsum}G"
+}
+# 新建块存储卷（当前区域，不挂载）
+_vol_label(){ printf '%s' "$1" | tr -c 'A-Za-z0-9-' '-' | cut -c1-16; }
+disk_create(){
+  local hr="${HOME_REGION:-$OCI_REGION}" r="$OCI_REGION"
+  local ads; ads=$(o iam availability-domain list --query 'data[].name' 2>/dev/null | jq -r '.[]' 2>/dev/null)
+  local ad; ad=$(head -1 <<< "$ads")
+  if [ "$(grep -c . <<< "$ads")" -gt 1 ]; then local k=0 x; local -a A=(); while read -r x; do k=$((k+1)); A[$k]="$x"; echo "  $k  $x"; done <<< "$ads"; _ask -rp "可用域编号[1]: " x; ad="${A[${x:-1}]}"; fi
+  [ -z "$ad" ] && { echo "$(_t "读取可用域失败" "L_AD_FAIL")"; return; }
+  local nm sz vp; _ask -rp "$(_t "名称（按用途起，如 data/backup/media/fee-volume；字母数字和-，最长16）[data]（输 0 返回）: " "L_ASK_VOL_NAME")" nm; [ "$nm" = "0" ] && { echo "$(_t "已取消" "L_CANCELLED")"; return; }; nm="${nm:-data}"
+  [[ "$nm" =~ ^[A-Za-z0-9-]{1,16}$ ]] || { echo "$(_t "名称只能用字母、数字和 -，最长16位" "L_NAME_RULE")"; return; }
+  if _scan_region_disks "$r" | awk -F'\t' -v n="$nm" '$3==n{f=1} END{exit !f}'; then echo "$(_t "当前区域已有同名的盘「%s」，换个名字" "L_DUP_NAME" "$nm")"; return; fi
+  _ask -rp "$(_t "大小GB[50]（最小50）（输 0 返回）: " "L_ASK_VOL_SIZE")" sz; [ "$sz" = "0" ] && { echo "$(_t "已取消" "L_CANCELLED")"; return; }; sz="${sz:-50}"; _is_int "$sz" && [ "$sz" -ge 50 ] || { echo "$(_t "必须是 ≥50 的整数" "L_GE_50")"; return; }
+  _ask -rp "$(_t "VPU[10]（0/10/20…120）（输 0 返回）: " "L_ASK_VOL_VPU")" vp; [ "$vp" = "0" ] && { echo "$(_t "已取消" "L_CANCELLED")"; return; }; vp="${vp:-10}"; _is_int "$vp" && [ $((vp%10)) -eq 0 ] && [ "$vp" -le 120 ] || { echo "$(_t "VPU 无效" "L_VPU_INVALID")"; return; }
+  # 计费预估：统计当前区域已用
+  local used=0 t id n s v a
+  while IFS=$'\t' read -r t id n s v a; do [ -n "$s" ] && used=$((used+s)); done < <(_scan_region_disks "$r")
+  local bill
+  if [ "$r" = "$hr" ]; then
+    local after=$((used+sz)); local over=$((after-200)); [ $over -lt 0 ] && over=0; [ $over -gt $sz ] && over=$sz
+    bill="主区域已用 ${used}G → 建后 ${after}G / 免费200G，本卷计费 ${over}G"
+  else bill="当前是副区域，本卷 ${sz}G 全部计费"; fi
+  line; echo "$(_t "  区域：%s  可用域：%s" "L_VOL_REGION_AD" "$r" "${ad##*:}")"; echo "$(_t "  名称：%s  大小：%sG  VPU：%s" "L_VOL_INFO" "$nm" "${sz}" "$vp")"; echo "  $bill"; echo "$(_t "  不挂载到任何实例，删除即停止计费" "L_VOL_NO_ATTACH")"; line
+  _confirm "确认创建？" || return
+  echo "$(_t "创建中..." "L_CREATING")"
+  local out; out=$(o bv volume create -c "$TENANCY" --availability-domain "$ad" --display-name "$nm" --size-in-gbs "$sz" --vpus-per-gb "$vp" \
+    --wait-for-state AVAILABLE --max-wait-seconds 300 2>&1)
+  if echo "$out" | grep -q '"lifecycle-state": "AVAILABLE"'; then
+    echo "$(_t "已创建：%s %sG（%s）" "L_VOL_CREATED" "$nm" "${sz}" "$bill")"
+    _push_acct "📦" "新建块存储卷" "区域：$r" "名称：$nm" "大小：${sz}G  VPU：$vp" "状态：AVAILABLE（未挂载）" "计费：$bill"
+  else
+    echo "失败：$(_oci_err "$out")"; _push_acct "❌" "新建块存储卷失败" "区域：$r" "名称：$nm" "原因：$(_oci_err "$out")"
+  fi
+}
+# 删除未挂载的盘
+disk_delete_free(){
+  disk_scan_all only_free
+  [ "${DISK_COUNT:-0}" -eq 0 ] && { echo "$(_t "没有未挂载的盘。" "L_NO_UNATTACHED")"; return; }
+  local k; _ask -rp "$(_t "输入要删除的编号（0取消）: " "L_ASK_DEL_NUM")" k
+  [ -z "$k" ] || [ "$k" = 0 ] && return
+  local id="${DISK_ID[$k]}" t="${DISK_TYPE[$k]}" r="${DISK_REG[$k]}" nm="${DISK_NM[$k]}" sz="${DISK_SZ[$k]}"
+  [ -z "$id" ] && { echo "$(_t "编号无效" "L_INVALID_NUM")"; return; }
+  _ask -rp "确认永久删除 $t「$nm」${sz}G（$r），数据不可恢复？输 yes 确认: " c; [ "$c" = yes ] || return
+  local out
+  if [ "$t" = 引导卷 ]; then out=$(_oc "$r" bv boot-volume delete --boot-volume-id "$id" --force --wait-for-state TERMINATED --max-wait-seconds 300 2>&1)
+  else out=$(_oc "$r" bv volume delete --volume-id "$id" --force --wait-for-state TERMINATED --max-wait-seconds 300 2>&1); fi
+  if [ $? -eq 0 ]; then echo "$(_t "已删除：%s" "L_DELETED_X" "$nm")"; _push_acct "🗑️" "删除盘" "区域：$r" "类型：$t" "名称：$nm" "大小：${sz}G" "状态：TERMINATED（已停止计费）"
+  else echo "失败：$(_oci_err "$out")"; _push_acct "❌" "删除盘失败" "区域：$r" "名称：$nm" "原因：$(_oci_err "$out")"; fi
+}
+# 挂载块存储卷到实例（当前区域，半虚拟化）
+disk_attach(){
+  local r="$OCI_REGION"
+  echo "读取当前区域未挂载的块存储卷..."
+  local -a VID=() VNM=() VSZ=(); local k=0 t id nm sz vp att
+  while IFS=$'\t' read -r t id nm sz vp att; do
+    [ "$t" = 块存储 ] && [ -z "$att" ] || continue
+    k=$((k+1)); VID[$k]="$id"; VNM[$k]="$nm"; VSZ[$k]="$sz"; echo "  $k  $nm  ${sz}G"
+  done < <(_scan_region_disks "$r")
+  [ $k -eq 0 ] && { echo "$(_t "当前区域没有未挂载的块存储卷（可用 6 新建）。" "L_NO_UNATTACHED2")"; return; }
+  local x; _ask -rp "选择卷编号: " x; local vid="${VID[$x]}" vnm="${VNM[$x]}" vsz="${VSZ[$x]}"; [ -z "$vid" ] && { echo "无效"; return; }
+  local vad; vad=$(o bv volume get --volume-id "$vid" --query 'data."availability-domain"' --raw-output 2>/dev/null)
+  echo "可挂载的实例（同一可用域 ${vad##*:}）："
+  local -a IID=() INM=(); k=0; local iid inm ist
+  while IFS=$'\t' read -r iid inm ist; do
+    [ -z "$iid" ] && continue; k=$((k+1)); IID[$k]="$iid"; INM[$k]="$inm"; echo "  $k  $inm  $ist"
+  done < <(o compute instance list -c "$TENANCY" --availability-domain "$vad" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"=="RUNNING" or ."lifecycle-state"=="STOPPED")|[.id,."display-name",."lifecycle-state"]|@tsv' 2>/dev/null)
+  [ $k -eq 0 ] && { echo "该可用域没有可挂载的实例。"; return; }
+  _ask -rp "$(_t "选择实例编号: " "L_ASK_INST_NUM")" x; local iid="${IID[$x]}" inm="${INM[$x]}"; [ -z "$iid" ] && { echo "无效"; return; }
+  _confirm "确认把 $vnm（${vsz}G）挂载到 $inm？" || return
+  echo "$(_t "挂载中（最多5分钟）..." "L_ATTACHING")"
+  local out; out=$(o compute volume-attachment attach --type paravirtualized --instance-id "$iid" --volume-id "$vid" \
+    --wait-for-state ATTACHED --max-wait-seconds 300 2>&1)
+  if echo "$out" | grep -q '"lifecycle-state": "ATTACHED"'; then
+    local lbl; lbl=$(_vol_label "$vnm"); local bytes=$((vsz*1073741824))
+    echo
+    echo "✅ $vnm（${vsz}G）已挂载到 $inm"
+    echo
+    echo "登录 $inm，整段复制粘贴下面这段（从 sudo 到 EOF）："
+    line
+    cat <<EOF
+sudo bash <<'XEOF'
+L=$lbl; M=/mnt/$lbl; B=$bytes
+if findmnt -rn -S LABEL=\$L >/dev/null; then echo "✅ 已在使用：\$(findmnt -rno TARGET -S LABEL=\$L)"; exit 0; fi
+D=\$(blkid -L \$L 2>/dev/null)
+if [ -z "\$D" ]; then
+  C=\$(for d in \$(lsblk -dpnbo NAME,SIZE,TYPE | awk -v b=\$B '\$3=="disk" && \$2==b{print \$1}'); do
+       [ -z "\$(lsblk -no FSTYPE,MOUNTPOINT \$d | tr -d ' \n')" ] && [ "\$(lsblk -no NAME \$d | wc -l)" = 1 ] && echo \$d; done)
+  N=\$(echo "\$C" | grep -c .)
+  [ "\$N" = 1 ] || { echo "❌ 找到 \$N 块符合条件的空盘：\$C，已停止，请手动处理"; exit 1; }
+  D=\$C; mkfs.ext4 -q -L \$L \$D || { echo "❌ 格式化失败"; exit 1; }
+fi
+mkdir -p \$M && mount \$D \$M || { echo "❌ 挂载失败"; exit 1; }
+grep -q "^LABEL=\$L " /etc/fstab || echo "LABEL=\$L \$M ext4 defaults,nofail 0 2" >> /etc/fstab
+echo "✅ 已挂载到 \$M，可用 \$(df -h --output=avail \$M | tail -1 | tr -d ' ')"
+XEOF
+EOF
+    line
+    echo "$(_t "数据目录：/mnt/%s" "L_DATA_DIR" "$lbl")"
+    _push_acct "🔗" "挂载块存储卷" "区域：$r" "卷：$vnm（${vsz}G）" "实例：$inm" "状态：ATTACHED（云端已挂载）" "目录：/mnt/$lbl（需在节点机执行挂载命令后可用）"
+  else
+    echo "失败：$(_oci_err "$out")"; _push_acct "❌" "挂载块存储卷失败" "区域：$r" "卷：$vnm" "实例：$inm" "原因：$(_oci_err "$out")"
+  fi
+}
+# 从实例卸载块存储卷（当前区域）
+disk_detach(){
+  echo "读取当前区域已挂载的块存储卷..."
+  declare -A INAME; local id nm
+  while IFS=$'\t' read -r id nm; do [ -n "$id" ] && INAME[$id]="$nm"; done < <(o compute instance list -c "$TENANCY" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"!="TERMINATED")|[.id,."display-name"]|@tsv' 2>/dev/null)
+  local -a AID=() ANM=() AIN=(); local k=0 aid vid iid vnm vsz
+  while IFS=$'\t' read -r aid vid iid; do
+    [ -z "$aid" ] && continue
+    IFS=$'\t' read -r vnm vsz < <(o bv volume get --volume-id "$vid" 2>/dev/null | jq -r '.data|[."display-name",(."size-in-gbs"|tostring)]|@tsv')
+    k=$((k+1)); AID[$k]="$aid"; ANM[$k]="$vnm（${vsz}G）"; AIN[$k]="${INAME[$iid]:-$iid}"; echo "  $k  $vnm  ${vsz}G  → ${AIN[$k]}"
+  done < <(o compute volume-attachment list -c "$TENANCY" --all 2>/dev/null \
+    | jq -r '.data[]|select(."lifecycle-state"=="ATTACHED")|[.id,."volume-id",."instance-id"]|@tsv' 2>/dev/null)
+  [ $k -eq 0 ] && { echo "$(_t "当前区域没有已挂载的块存储卷。" "L_NO_ATTACHED")"; return; }
+  local x; _ask -rp "选择编号: " x; local aid="${AID[$x]}"; [ -z "$aid" ] && { echo "无效"; return; }
+  line
+  local lbl; lbl=$(_vol_label "${ANM[$x]%%（*}")
+  echo "⚠️ 先登录 ${AIN[$x]}，整段复制粘贴下面这段（安全弹出 ${ANM[$x]}）："
+  line
+  cat <<EOF
+sudo bash <<'XEOF'
+L=$lbl
+D=\$(blkid -L \$L 2>/dev/null)
+if [ -z "\$D" ] && [ "\$(blkid -t LABEL=data -o device | grep -c .)" = 1 ]; then L=data; D=\$(blkid -L data); echo "ℹ️ 按旧方式（卷标 data）找到这块盘"; fi
+[ -z "\$D" ] && { echo "❌ 本机没找到这块盘（卷标 $lbl），请确认登录的是不是 ${AIN[$x]}"; exit 1; }
+U=\$(blkid -s UUID -o value \$D); M=\$(findmnt -rno TARGET \$D)
+if [ -n "\$M" ]; then umount \$M || { echo "❌ \$M 正在被使用，先停掉相关程序再试"; exit 1; }; echo "✅ 已弹出 \$M"; fi
+sed -i "/^LABEL=\$L /d;/^UUID=\$U /d" /etc/fstab && echo "✅ 已清理开机自动挂载"
+XEOF
+EOF
+  line
+  _ask -rp "节点机显示「已弹出」或「已清理」后，输 yes 卸载 ${ANM[$x]} ← ${AIN[$x]}: " c; [ "$c" = yes ] || return
+  local out; out=$(o compute volume-attachment detach --volume-attachment-id "$aid" --force --wait-for-state SUCCEEDED --max-wait-seconds 300 2>&1)
+  if [ $? -eq 0 ]; then echo "$(_t "已卸载，该卷现在为未挂载状态（可用 7 删除停止计费）。" "L_DETACHED")"; _push_acct "🔌" "卸载块存储卷" "区域：$OCI_REGION" "卷：${ANM[$x]}" "实例：${AIN[$x]}" "状态：DETACHED（已卸载，未删除仍计费）"
+  else echo "失败：$(_oci_err "$out")"; _push_acct "❌" "卸载块存储卷失败" "区域：$OCI_REGION" "卷：${ANM[$x]}" "原因：$(_oci_err "$out")"; fi
+}
+bv_menu(){ while true; do echo; echo "$(_t "── 引导卷 / 存储 ──" "L_VOL_TITLE")"; echo " 1查看 2扩容 3调性能 4缩硬盘"; echo " 5全部盘(含未挂载) 6新建块存储卷 7删除未挂载的盘"; echo " 8挂载块存储卷 9卸载块存储卷 0返回"; _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x; case "$x" in 8)disk_attach;pause;; 9)disk_detach;pause;; 1)bv_list;pause;; 2)bv_expand;pause;; 3)bv_perf;pause;; 4)bv_shrink;pause;; 5)disk_scan_all;pause;; 6)disk_create;pause;; 7)disk_delete_free;pause;; 0)return;; esac; done; }
+# ============ 虚拟云网络：新建子网 ============
+# 简单校验 CIDR 格式（x.x.x.x/y）
+_valid_cidr(){
+  local c="$1" ip mask
+  case "$c" in */*) ip="${c%/*}"; mask="${c#*/}";; *) return 1;; esac
+  case "$mask" in ""|*[!0-9]*) return 1;; esac
+  [ "$mask" -gt 32 ] && return 1
+  local tmp="$ip" n=0
+  while [ -n "$tmp" ]; do
+    n=$((n+1))
+    case "$tmp" in *.*) tmp="${tmp#*.}";; *) tmp="";; esac
+  done
+  [ "$n" -eq 4 ] || return 1
+  local o1 o2 o3 o4 rest
+  o1="${ip%%.*}"; rest="${ip#*.}"
+  o2="${rest%%.*}"; rest="${rest#*.}"
+  o3="${rest%%.*}"; o4="${rest#*.}"
+  local o
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    case "$o" in ""|*[!0-9]*) return 1;; esac
+    [ "$o" -gt 255 ] && return 1
+  done
+  return 0
+}
+net_create_subnet(){
+  echo "$(_t "读取 VCN..." "L_NET_READING_VCN")"
+  local vcn_raw; vcn_raw=$(o network vcn list -c "$TENANCY" 2>&1)
+  local vcns; vcns=$(echo "$vcn_raw" | jq -r '.data[]|[."display-name",."cidr-block",."id"]|@tsv' 2>/dev/null)
+  if [ -z "$vcns" ]; then
+    echo "$(_t "VCN 查询失败或本区域无 VCN：" "L_NET_VCN_FAIL")"
+    echo "$vcn_raw" | head -5
+    return
+  fi
+  local -a VCN_IDS=() VCN_NAMES=() VCN_CIDRS=(); local i=0 vn vc vi
+  while IFS=$'\t' read -r vn vc vi; do
+    [ -z "$vi" ] && continue; i=$((i+1)); VCN_IDS[$i]="$vi"; VCN_NAMES[$i]="$vn"; VCN_CIDRS[$i]="$vc"
+    printf "  %-3s %-24s %s\n" "$i" "$vn" "$vc"
+  done <<< "$vcns"
+  local si; _askc "$(_t "选择 VCN 编号" "L_NET_CHOOSE_VCN")" si || return
+  local vcn_id="${VCN_IDS[$si]}" vcn_name="${VCN_NAMES[$si]}" vcn_cidr="${VCN_CIDRS[$si]}"
+  [ -z "$vcn_id" ] && { echo "$(_t "无效" "L_INVALID")"; return; }
+  echo "$(_t "VCN：${vcn_name}（${vcn_cidr}）" "L_NET_VCN_INFO" "$vcn_name" "$vcn_cidr")"
+  echo "$(_t "已有子网（避免 CIDR 冲突）：" "L_NET_EXISTING")"
+  o network subnet list -c "$TENANCY" --vcn-id "$vcn_id" 2>/dev/null | jq -r '.data[]|"  \(."display-name")  \(."cidr-block")"' 2>/dev/null
+  local sn; _ask -rp "$(_t "子网名: " "L_NET_SUBNET_NAME")" sn
+  [ -z "$sn" ] && { echo "$(_t "名称不能为空" "L_NAME_REQUIRED")"; return; }
+  local cidr; _ask -rp "$(_t "CIDR（如 10.0.1.0/24，需在 VCN 网段内且不与已有子网冲突）: " "L_NET_CIDR")" cidr
+  _valid_cidr "$cidr" || { echo "$(_t "CIDR 格式无效" "L_NET_CIDR_INVALID")"; return; }
+  local pub; _ask -rp "$(_t "子网类型：1公网（自动分配公网IP） 2私网 [1]: " "L_NET_PUB_PRIV")" pub; pub="${pub:-1}"
+  local prohibit="false"; [ "$pub" = "2" ] && prohibit="true"
+  _confirm "$(_t "在 ${vcn_name} 下创建子网 ${sn}（${cidr}）？" "L_NET_CONFIRM" "$vcn_name" "$sn" "$cidr")" || return
+  echo "$(_t "创建中..." "L_CREATING")"
+  local out; out=$(o network subnet create -c "$TENANCY" --vcn-id "$vcn_id" --cidr-block "$cidr" --display-name "$sn" --prohibit-public-ip-on-vnic "$prohibit" --query "data.id" --raw-output 2>&1)
+  if [[ "$out" == ocid1.subnet* ]]; then
+    echo "$(_t "子网创建成功：${sn}（${cidr}）" "L_NET_CREATED" "$sn" "$cidr")"
+  else
+    echo "$(_t "失败：" "L_FAILED")$(_oci_err "$out")"
+  fi
+}
+net_menu(){ while true; do echo; echo "$(_t "── 虚拟云网络 ──" "L_NET_TITLE")"; echo " 1看实例生效规则 2开放端口 3关闭端口 4放行全部 5全部子网 6新建子网 0返回"; _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x; case "$x" in 1)net_effective;pause;; 2)net_open_port;pause;; 3)net_close_port;pause;; 4)net_open_all;pause;; 5)net_list_all;pause;; 6)net_create_subnet;pause;; 0)return;; esac; done; }
+# 时区设置（按大洲分组，列出全部 IANA 时区）
+set_timezone(){
+  echo "$(_t "── 时区设置 ──" "L_TZ_TITLE")"
+  echo " $(_t "当前" "L_CURRENT"): $(get_tz)"
+  echo " 1 $(_t "亚洲" "L_TZ_ASIA")   2 $(_t "欧洲" "L_TZ_EUROPE")   3 $(_t "美洲" "L_TZ_AMERICA")"
+  echo " 4 $(_t "大洋洲" "L_TZ_OCEANIA")   5 $(_t "非洲" "L_TZ_AFRICA")   6 $(_t "UTC/其他" "L_TZ_OTHER")"
+  echo " 0 $(_t "返回" "L_BACK")"
+  local x; _ask -rp "$(_t "选择" "L_CHOOSE"): " x
+  case "$x" in
+    1)_tz_pick Asia;; 2)_tz_pick Europe;; 3)_tz_pick America;;
+    4)_tz_pick Pacific Australia;; 5)_tz_pick Africa;;
+    6)_tz_pick Etc Antarctica Atlantic Indian ROOTFILES;;
+    0)return;;
+  esac
+}
+# 列出指定 zoneinfo 目录下的全部时区供选择
+_tz_pick(){
+  local -a zones=() d z
+  for d in "$@"; do
+    if [ "$d" = "ROOTFILES" ]; then
+      while IFS= read -r z; do zones+=("$z"); done < <(cd /usr/share/zoneinfo 2>/dev/null && find . -maxdepth 1 -type f ! -name '*.tab' ! -name '*.list' ! -name 'leapseconds' ! -name 'localtime' ! -name 'posixrules' | sed 's|^\./||' | sort)
+    else
+      while IFS= read -r z; do zones+=("$d/$z"); done < <(cd "/usr/share/zoneinfo/$d" 2>/dev/null && find . -type f | sed 's|^\./||' | sort)
+    fi
+  done
+  local n=${#zones[@]} i=0 c sel
+  [ "$n" -eq 0 ] && { echo "$(_t "无可用时区" "L_TZ_NONE")"; return; }
+  for z in "${zones[@]}"; do
+    i=$((i+1)); printf " %3d %-30s" "$i" "$z"
+    [ $((i % 2)) -eq 0 ] && echo
+  done
+  [ $((i % 2)) -ne 0 ] && echo
+  _ask -rp "$(_t "选择" "L_CHOOSE") (1-$n, 0 $(_t "返回" "L_BACK")): " c
+  case "$c" in 0|"") return;; esac
+  if [ "$c" -ge 1 ] 2>/dev/null && [ "$c" -le "$n" ] 2>/dev/null; then
+    sel="${zones[$((c-1))]}"
+    if [ -f "/usr/share/zoneinfo/$sel" ]; then
+      echo "$sel" > "$HOME_DIR/timezone"
+      echo "$(_t "已设为 %s" "L_TZ_SET" "$sel")"
+    else
+      echo "$(_t "无效的时区" "L_TZ_INVALID")"
+    fi
+  else
+    echo "$(_t "无效的选择" "L_TZ_INVALID_SEL")"
+  fi
+}
+sys_menu(){ while true; do echo; echo "$(_t "── 系统配置 ──" "L_SYS_TITLE")"; echo " $(_t "1添加账号" "L_SYS_ADD_ACCOUNT") $(_t "2删除账号" "L_SYS_DEL_ACCOUNT") $(_t "3从oci-helper导入" "L_SYS_IMPORT_HELPER")"; echo " $(_t "4钉钉设置" "L_SYS_DINGTALK") $(_t "5Cloudflare设置" "L_SYS_CLOUDFLARE") $(_t "6验证租户可用性" "L_SYS_VERIFY") $(_t "7语言/Language" "L_SYS_LANG")"; echo " $(_t "8每日账单" "L_SYS_BILLING") $(_t "9密码设置" "L_SYS_PASSWD") $(_t "10时区" "L_SYS_TZ") $(_t "11安全巡检" "L_SYS_SECURITY")"
+    echo " $(_t "0返回" "L_MENU_BACK")"; _ask -rp "$(_t "选择" "L_CHOOSE"): " x; case "$x" in 6)echo "$(_t "刷新信息不完整的账号..." "L_REFRESHING")"; verify_usability; pause;; 1)add_account;pause;; 2)del_account;pause;; 3)_ask -rp "$(_t "helper数据库" "L_HELPER_DB")[/app/oci-helper/oci-helper.db]: " db; import_from_helper "${db:-/app/oci-helper/oci-helper.db}"; pause;; 4)set_dingtalk;pause;; 5)set_cloudflare;pause;; 7)set_language;pause;; 8)billing_menu;; 9)set_password;pause;; 10)set_timezone;pause;; 11)security_inspection_menu;pause;; 0)return;; esac; done; }
+# 语言切换
+set_language(){
+  echo "$(_t "── 语言设置 ──" "L_LANG_TITLE")"
+  echo " $(_t "当前" "L_CURRENT"): $([ "$OCI_CN_LANG" = "en" ] && echo "English" || echo "中文")"
+  echo " 1 中文   2 English   0 $(_t "返回" "L_BACK")"
+  local x; _ask -rp "$(_t "选择" "L_CHOOSE"): " x
+  case "$x" in
+    1) echo "zh" > "$HOME_DIR/lang"; OCI_CN_LANG="zh"; echo "$(_t "已切换为中文，重启脚本生效。" "L_LANG_ZH_DONE")";;
+    2) echo "en" > "$HOME_DIR/lang"; OCI_CN_LANG="en"
+       _langfile="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/lang/en.sh"
+       [ -f "$_langfile" ] && source "$_langfile"
+       echo "Switched to English.";;
+    0) return;;
+  esac
+}
+set_cloudflare(){
+  # 域名从已保存配置或 API 动态获取，不写死
+  local _cfgdomain=""; [ -f "$CF_FILE" ] && _cfgdomain=$(sed -n '4p' "$CF_FILE")
+  echo "── Cloudflare 设置（换IP后自动更新${_cfgdomain:-你域名}的 DNS 记录）──"
+  if [ -f "$CF_FILE" ]; then
+    local _rt; _rt=$(sed -n '3p' "$CF_FILE"); [ -z "$_rt" ] && _rt="A"
+    echo "已配置（域名：${_cfgdomain:-未知}，记录类型：$_rt）。 1 重新设置   2 测试   3 关闭   0 返回"
+    _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x
+    case "$x" in
+      2) local t z; t=$(sed -n '1p' "$CF_FILE"); z=$(sed -n '2p' "$CF_FILE")
+         echo "$(_t "验证 Token..." "L_VERIFYING_TOKEN")"
+         local r; r=$(curl -s -m 15 -H "Authorization: Bearer $t" "https://api.cloudflare.com/client/v4/zones/$z" 2>/dev/null | jq -r '.result.name // .errors[0].message' 2>/dev/null)
+         echo "$(_t "结果：%s（显示域名即成功）" "L_VERIFY_RESULT" "$r")"; return;;
+      3) rm -f "$CF_FILE"; echo "$(_t "已关闭 CF 自动更新。" "L_CF_DISABLED")"; return;;
+      0) return;;
+    esac
+  fi
+  echo "粘贴 API Token（cfat_... 或旧式 Token，输 0 取消）："
+  read -r tok; [ -z "$tok" ] || [ "$tok" = "0" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  # Zone ID 不再手填：用域名自动解析（Token 需有 Zone 读取权限）；误粘 32 位 Zone ID 也兼容
+  if [ -n "$_cfgdomain" ]; then
+    echo "$(_t "输入域名（回车沿用 " "L_ASK_CF_DOMAIN_D")${_cfgdomain}，输 0 取消）："
+  else
+    echo "$(_t "输入域名（如 example.com，输 0 取消）：" "L_ASK_CF_DOMAIN")"
+  fi
+  local _indomain; read -r _indomain
+  [ "$_indomain" = "0" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  [ -z "$_indomain" ] && _indomain="$_cfgdomain"
+  [ -z "$_indomain" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  echo "$(_t "验证中..." "L_VERIFYING")"
+  local r zid
+  if [[ "$_indomain" =~ ^[0-9a-fA-F]{32}$ ]]; then
+    zid="$_indomain"
+    r=$(curl -s -m 15 -H "Authorization: Bearer $tok" "https://api.cloudflare.com/client/v4/zones/$zid" 2>/dev/null | jq -r '.result.name // empty' 2>/dev/null)
+  else
+    local _zr; _zr=$(curl -s -m 15 -H "Authorization: Bearer $tok" "https://api.cloudflare.com/client/v4/zones?name=$_indomain" 2>/dev/null)
+    zid=$(echo "$_zr" | jq -r '.result[0].id // empty' 2>/dev/null)
+    r=$(echo "$_zr" | jq -r '.result[0].name // empty' 2>/dev/null)
+  fi
+  # 严格校验：必须返回一个像域名的字符串（有点、有TLD、不含空格和错误关键词）
+  if ! [[ "$r" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+    echo "$(_t "验证失败：Token 无效、域名不在该账户下，或 Token 缺少 Zone 读取权限，未保存。" "L_CF_VERIFY_FAIL2")"
+    return
+  fi
+  echo "$(_t "域名：%s" "L_DOMAIN_X" "$r")"
+  echo "换IP时更新哪些记录类型？[A] / AAAA / A,AAAA（逗号分隔，输 0 取消）"
+  local rt; _ask -rp "$(_t "记录类型 [A]: " "L_ASK_RECTYPE")" rt; rt="${rt:-A}"
+  [ "$rt" = "0" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  # 校验记录类型合法性
+  local _valid=1; IFS=',' read -ra _RTS <<< "$rt"
+  for _t in "${_RTS[@]}"; do _t=$(echo "$_t" | tr -d ' ' | tr 'a-z' 'A-Z'); case "$_t" in A|AAAA) ;; *) _valid=0;; esac; done
+  [ "$_valid" = 0 ] && { echo "记录类型无效（只支持 A / AAAA），未保存。"; return; }
+  printf '%s\n%s\n%s\n%s\n' "$tok" "$zid" "$rt" "$r" > "$CF_FILE"; chmod 600 "$CF_FILE"
+  echo "已保存（$r，记录类型：$rt）。"
+}
+
+# ── 每日账单 ──
+do_daily_billing(){
+  local yesterday today s e
+  yesterday=$(date -u -d '1 day ago' +%Y-%m-%d 2>/dev/null)
+  [ -z "$yesterday" ] && yesterday=$(date -u -v-1d +%Y-%m-%d 2>/dev/null)
+  today=$(date -u +%Y-%m-%d 2>/dev/null)
+  # DAILY 粒度要求整点：昨日零点到今日零点
+  s="${yesterday}T00:00:00Z"; e="${today}T00:00:00Z"
+
+  # 租户选择：daily-billing-accounts 存在则只推选中的，否则全部 PAYG
+  local sel_file="$HOME_DIR/daily-billing-accounts"
+  local -a accounts=()
+  if [ -f "$sel_file" ]; then
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local st8; st8=$(awk 'BEGIN{FS="\t"} $1==n{print $8}' n="$line" "$ACC_FILE" 2>/dev/null)
+      [ "$st8" = "INVALID" ] && continue
+      accounts+=("$line")
+    done < "$sel_file"
+  else
+    while IFS=$'\t' read -r name _t _u _f _h _tn _pl _st; do
+      [ -z "$name" ] && continue
+      [ "$_pl" = "PAYG" ] && [ "$_st" != "INVALID" ] && accounts+=("$name")
+    done < "$ACC_FILE"
+  fi
+
+  local title="💰 每日账单 $yesterday"
+  local body=""
+  local i=0
+  for name in "${accounts[@]}"; do
+    i=$((i+1))
+    # 从 accounts.tsv 获取 region
+    local region=$(grep -P "^${name}\t" "$ACC_FILE" 2>/dev/null | cut -f5)
+    [ -z "$region" ] && region=$(grep "^${name}	" "$ACC_FILE" 2>/dev/null | cut -f5)
+    local amt="?" cur="JPY"
+    if [ -n "$region" ]; then
+      local cfg=$(oci_cfg "$name" "$region" 2>/dev/null)
+      if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+        local tenancy=$(grep "^${name}	" "$ACC_FILE" 2>/dev/null | cut -f2)
+        local out=$(oci --config-file "$cfg" --region "$region" usage-api usage-summary request-summarized-usages --tenant-id "$tenancy" --time-usage-started "$s" --time-usage-ended "$e" --granularity DAILY --query-type COST 2>/dev/null)
+        if [ -n "$out" ]; then
+          echo "$out" | BILL_NAME="$name" BILL_DATE="$yesterday" python3 -c "
+import json,sys,os
+from datetime import datetime
+d=json.load(sys.stdin)
+items=d['data']['items']
+log='/var/log/oci-billing-raw.log'
+try:
+    with open(log,'a') as f:
+        f.write(datetime.now().isoformat()+' name='+os.environ.get('BILL_NAME','?')+' date='+os.environ.get('BILL_DATE','?')+' items='+str(len(items))+'
+')
+        for it in items:
+            f.write('  amt='+str(it.get('computed-amount'))+' cur='+str(it.get('currency'))+'
+')
+except: pass
+" 2>/dev/null
+          local grouped=$(echo "$out" | python3 -c "
+import json,sys
+from collections import OrderedDict
+d=json.load(sys.stdin)
+items=d['data']['items']
+g=OrderedDict()
+for it in items:
+    c=it.get('currency') or 'JPY'
+    a=it.get('computed-amount') or 0
+    g[c]=g.get(c,0)+a
+parts=['%.2f %s' % (a,c) for c,a in g.items()]
+print(' / '.join(parts) if parts else '0.00 JPY')
+" 2>/dev/null)
+          if [ -n "$grouped" ]; then amt="$grouped"; cur=""; fi
+        fi
+      fi
+    fi
+    body="${body}${i}、${name} ${amt} ${cur}  
+"
+  done
+
+  local now=$(bj_time)
+  local md="💰 每日账单 $yesterday
+
+${body}时间：${now}"
+  # 标题、正文分开传（与账单查询推送格式一致），按真实发送结果输出
+  if dingtalk_push "$title" "$md" 2>/dev/null; then
+    echo "$(_t "已推送" "L_BILL_PUSHED")"
+  else
+    echo "$(_t "推送失败" "L_BILL_PUSH_FAIL")"
+  fi
+}
+
+billing_tick(){
+  local conf="$HOME_DIR/daily-billing.conf"
+  [ -f "$conf" ] || return 0
+  local set_time=$(head -1 "$conf" 2>/dev/null | tr -d ' \n\r')
+  [ -z "$set_time" ] && return 0
+  # 检查开关
+  local enabled=$(sed -n '2p' "$conf" 2>/dev/null | tr -d ' \n\r')
+  [ "$enabled" = "0" ] && return 0
+  # 北京时间当前时间
+  local now_bj=$(TZ=$(get_tz) date +%H:%M)
+  if [ "$now_bj" = "$set_time" ]; then
+    # 防止同一分钟内重复触发（按分钟粒度，允许一天内多次测试）
+    local last="$HOME_DIR/.billing_last"
+    local now_min=$(TZ=$(get_tz) date +%Y-%m-%d_%H:%M)
+    [ -f "$last" ] && [ "$(cat "$last")" = "$now_min" ] && return 0
+    echo "$now_min" > "$last"
+    verify_usability quiet
+    do_daily_billing
+  fi
+}
+
+select_billing_accounts(){
+  local sel_file="$HOME_DIR/daily-billing-accounts"
+  echo "选择要推送的租户（FREE_TIER 不显示）："
+  local -a payg_names=()
+  local idx=0
+  while IFS=$'\t' read -r name _t _u _f _h _tn _pl _st; do
+    [ -z "$name" ] && continue
+    [ "$_pl" = "PAYG" ] || continue
+    [ "$_st" = "INVALID" ] && continue
+    idx=$((idx+1))
+    payg_names+=("$name")
+    echo " $idx) $name"
+  done < "$ACC_FILE"
+  echo " 0) 返回（不改）"
+  echo " 直接回车=全部 PAYG"
+  _ask -rp "输入编号（空格分隔）: " sel
+  [ "$sel" = "0" ] && return
+  if [ -z "$sel" ]; then
+    rm -f "$sel_file"
+    echo "已设为全部 PAYG"
+    return
+  fi
+  > "$sel_file"
+  for n in $sel; do
+    if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$idx" ] 2>/dev/null; then
+      echo "${payg_names[$((n-1))]}" >> "$sel_file"
+    fi
+  done
+  echo "已保存 $(wc -l < "$sel_file") 个租户"
+}
+
+billing_menu(){
+  while true; do
+    local conf="$HOME_DIR/daily-billing.conf"
+    local tm="12:00" en="开启"
+    [ -f "$conf" ] && tm=$(head -1 "$conf" | tr -d ' \n\r')
+    [ -f "$conf" ] && [ "$(sed -n '2p' "$conf" | tr -d ' \n\r')" = "0" ] && en="关闭"
+    echo
+    echo "── 每日账单 ──"
+    echo "状态: $en | 推送时间: $tm ($(get_tz))"
+    echo " 1修改推送时间 2测试推送"
+    echo " 3开启/关闭 4选择租户 0返回"
+    _ask -rp "选择: " x
+    case "$x" in
+      1)
+        _ask -rp "推送时间 (HH:MM): " nt
+        nt=$(echo "$nt" | tr -d ' \t\n\r')
+        if [[ "$nt" =~ ^[0-9]{2}:[0-9]{2}$ ]]; then
+          local e2=$(sed -n '2p' "$conf" 2>/dev/null)
+          echo "$nt" > "$conf"
+          [ -n "$e2" ] && echo "$e2" >> "$conf"
+          echo "已设为 $nt"
+        else
+          echo "格式错误"
+        fi
+        ;;
+      2) do_daily_billing;;
+      3)
+        local cur="1"
+        [ -f "$conf" ] && cur=$(sed -n '2p' "$conf" | tr -d ' \n\r')
+        [ -z "$cur" ] && cur="1"
+        local nt="0"; [ "$cur" = "0" ] && nt="1"
+        local t1=$(head -1 "$conf" 2>/dev/null); [ -z "$t1" ] && t1="12:00"
+        echo "$t1" > "$conf"; echo "$nt" >> "$conf"
+        [ "$nt" = "1" ] && echo "已开启" || echo "已关闭"
+        ;;
+      4) select_billing_accounts;;
+      0) return;;
+    esac
+    pause
+  done
+}
+
+set_password(){
+  local flag="$HOME_DIR/.nopass"
+  echo
+  if [ -f "$flag" ]; then
+    echo "当前：无密码（明文）"
+  else
+    echo "当前：已设密码（密文）"
+  fi
+  echo " 1设置密码 2取消密码(明文)"
+  echo " 0返回"
+  _ask -rp "选择: " x
+  case "$x" in
+    1)
+      _ask -rsp "输入新密码: " p1; echo
+      _ask -rsp "再次输入: " p2; echo
+      [ "$p1" = "$p2" ] || { echo "两次不一致"; return; }
+      [ -z "$p1" ] && { echo "密码不能为空"; return; }
+      # 先用旧密码解密到临时目录（兼容明文和密文两种当前状态）
+      local tmpd=$(mktemp -d 2>/dev/null) || { echo "临时目录创建失败"; return; }
+      local ok=1 cnt=0
+      if [ -f "$flag" ]; then
+        # 当前明文：直接复制 .pem
+        for f in "$KEYS_DIR"/*.pem; do
+          [ -f "$f" ] || continue
+          cp "$f" "$tmpd/" 2>/dev/null && cnt=$((cnt+1))
+        done
+      else
+        # 当前密文：用旧 PASS 解密 .pem.enc
+        for f in "$KEYS_DIR"/*.pem.enc; do
+          [ -f "$f" ] || continue
+          local base=$(basename "$f" .pem.enc)
+          if dec_key "$f" "$tmpd/$base.pem" 2>/dev/null && [ -s "$tmpd/$base.pem" ]; then
+            cnt=$((cnt+1))
+          else
+            ok=0; break
+          fi
+        done
+      fi
+      if [ "$ok" = "0" ] || [ "$cnt" = "0" ]; then
+        rm -rf "$tmpd"
+        echo "解密现有密钥失败，未改动"; return
+      fi
+      # 用新密码加密
+      PASS="$p1"
+      for f in "$tmpd"/*.pem; do
+        [ -f "$f" ] || continue
+        local base=$(basename "$f" .pem)
+        if ! enc_key "$f" "$KEYS_DIR/$base.pem.enc" 2>/dev/null; then ok=0; break; fi
+      done
+      rm -rf "$tmpd"
+      if [ "$ok" = "1" ]; then
+        # 更新 verify.enc 为新密码
+        printf '%s' "$VERIFY_TOKEN" | OCN_PW="$PASS" openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:OCN_PW -out "$VERIFY_ENC" 2>/dev/null
+        echo "0" > "$ATTEMPT_FILE"
+        rm -f "$KEYS_DIR"/*.pem "$flag"
+        # 同步 cron 密码，否则每日账单推送会因密码失效而中断
+        printf '%s' "$p1" > "$HOME_DIR/.cron_pass" 2>/dev/null && chmod 600 "$HOME_DIR/.cron_pass" 2>/dev/null
+        echo "已设置新密码，密钥已重新加密（cron 推送密码已同步）"
+      else
+        echo "加密失败，未改动（旧密码仍有效）"
+      fi
+      ;;
+    2)
+      # 需要验证当前密码（如果已设）
+      if [ ! -f "$flag" ]; then
+        _ask -rsp "输入当前密码: " p0; echo
+        [ "$p0" = "$PASS" ] || { echo "密码错误"; return; }
+        # 解密全部为明文
+        for f in "$KEYS_DIR"/*.pem.enc; do
+          [ -f "$f" ] || continue
+          local base=$(basename "$f" .pem.enc)
+          dec_key "$f" "$KEYS_DIR/$base.pem" 2>/dev/null
+        done
+        rm -f "$KEYS_DIR"/*.pem.enc "$VERIFY_ENC"
+      fi
+      touch "$flag"
+      PASS=""
+      rm -f "$HOME_DIR/.cron_pass"
+      echo "0" > "$ATTEMPT_FILE"
+      echo "已取消密码，密钥为明文"
+      ;;
+    0) return;;
+  esac
+}
+set_dingtalk(){
+  echo "── 钉钉推送设置 ──"
+  if [ -f "$DINGTALK_FILE" ]; then
+    local w; w=$(sed -n '1p' "$DINGTALK_FILE")
+    echo "当前 webhook：${w:0:50}..."
+    echo " 1 重新设置   2 测试推送   3 关闭推送   0 返回"
+    _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x
+    case "$x" in
+      2) notify "测试" "—" "如果收到说明配置成功"; echo "已发送，看群里有没有收到。"; return;;
+      3) rm -f "$DINGTALK_FILE"; echo "已关闭钉钉推送。"; return;;
+      0) return;;
+    esac
+  fi
+  echo "粘贴钉钉机器人 webhook（https://oapi.dingtalk.com/robot/send?access_token=...，输 0 取消）："
+  read -r wh
+  [ -z "$wh" ] || [ "$wh" = "0" ] && { echo "$(_t "取消" "L_CANCEL")"; return; }
+  echo "粘贴加签密钥（SEC开头；没用加签则直接回车）："
+  read -r sec
+  printf '%s\n%s\n' "$wh" "$sec" > "$DINGTALK_FILE"; chmod 600 "$DINGTALK_FILE"
+  echo "已保存。发送测试..."
+  notify "测试" "—" "配置成功，之后的操作都会推送到这里"
+  echo "看群里有没有收到测试消息。"
+}
+
+# ============ 非交互 CLI 模式（v6.5） ============
+# 用法: oci-cn --list-rules --instance <实例名或公网IP> [--account <账号名>] [--region <区域>] [--password <密码>]
+# 直接输出该实例生效的安全列表规则并推送钉钉，不进交互菜单。
+# 密码也可通过环境变量 OCI_CN_PASS 提供。
+cli_usage(){
+  echo "$(_t "用法：" "L_USAGE")"
+  echo "  $0 --list-rules --instance <实例名或公网IP> [--account <账号名>] [--region <区域>] [--password <密码>]"
+  echo "  $(_t "  $0 --open-port <端口> --protocol <tcp|udp|icmp|all> --instance <实例名或公网IP> [--account <账号名>] [--region <区域>] [--password <密码>] [--yes]" "L_CLI_USAGE_OPEN")"
+  echo "  $(_t "  $0 --close-port <编号...> --instance <实例名或公网IP> [--account <账号名>] [--region <区域>] [--password <密码>] [--yes]" "L_CLI_USAGE_CLOSE")"
+  echo "  $(_t "  $0 --replace-all --ports \"22/tcp,6700/tcp,6900/tcp,65530/tcp,6600/udp,6801/udp\" --instance <实例名或公网IP> [--account <账号名>] [--region <区域>] [--password <密码>] [--yes]" "L_CLI_USAGE_REPLACE")"
+  echo "  $(_t "密码也可用环境变量 OCI_CN_PASS 提供；不加 --yes 时仅预览 diff，不执行变更" "L_USAGE_PASS")"
+}
+# 在指定账号/区域中按实例名或公网IP匹配实例 -> 输出 "id\tname"，设置 SEL_ID/SEL_NAME
+_cli_match_instance(){  # $1=cfg $2=region $3=tenancy $4=keyword
+  local cfg="$1" r="$2" tenancy="$3" kw="$4"
+  local iid iname ip
+  while IFS=$'\t' read -r iid iname; do
+    [ -z "$iid" ] && continue
+    if [ "$iname" = "$kw" ]; then printf '%s\t%s\n' "$iid" "$iname"; return 0; fi
+    ip=$(oci --config-file "$cfg" --region "$r" compute instance list-vnics --instance-id "$iid" --query 'data[?"is-primary"]|[0]."public-ip"' --raw-output 2>/dev/null)
+    if [ "$ip" = "$kw" ]; then printf '%s\t%s\n' "$iid" "$iname"; return 0; fi
+  done < <(oci --config-file "$cfg" --region "$r" compute instance list -c "$tenancy" --all \
+    --query 'data[?"lifecycle-state"!=`"TERMINATED"`].[id,"display-name"]' 2>/dev/null | jq -r '.[]|@tsv' 2>/dev/null)
+  return 1
+}
+# 在账号的各区域中查找实例，命中则设置 ACC_NAME/TENANCY/OCI_REGION/OCI_CFG/SEL_ID/SEL_NAME/SEL_AD
+_cli_find_instance(){  # $1=账号名 $2=tenancy $3=主区域 $4=指定区域(可空) $5=关键字
+  local name="$1" tenancy="$2" home="$3" want="$4" kw="$5"
+  local regions
+  if [ -n "$want" ]; then regions="$want"
+  else
+    regions=$(oci --config-file "$(oci_cfg "$name" "$home")" --region "$home" iam region-subscription list \
+      --tenancy-id "$tenancy" 2>/dev/null | jq -r '.data[]."region-name"' 2>/dev/null)
+    [ -z "$regions" ] && regions="$home"
+  fi
+  local r cfg hit
+  for r in $regions; do
+    cfg=$(oci_cfg "$name" "$r")
+    hit=$(_cli_match_instance "$cfg" "$r" "$tenancy" "$kw" 2>/dev/null) || continue
+    SEL_ID=$(echo "$hit" | cut -f1); SEL_NAME=$(echo "$hit" | cut -f2)
+    ACC_NAME="$name"; TENANCY="$tenancy"; OCI_REGION="$r"; OCI_CFG="$cfg"
+    SEL_AD=$(oci --config-file "$cfg" --region "$r" compute instance get --instance-id "$SEL_ID" \
+      --query 'data."availability-domain"' --raw-output 2>/dev/null)
+    return 0
+  done
+  return 1
+}
+# ---------- CLI 共享：鉴权 + 定位实例 + 取默认安全列表 + 拼规则 ----------
+_cli_auth(){  # $1=pw
+  local pw="$1"
+  [ -f "$VERIFY_ENC" ] || { echo "$(_t "还未初始化，请先交互运行一次 oci-cn 设置密码。" "L_CLI_NOT_INIT")"; exit 1; }
+  [ -s "$ACC_FILE" ] || { echo "$(_t "无账号配置" "L_CLI_NO_ACCT")"; exit 1; }
+  if [ -n "$pw" ]; then PASS="$pw"
+  elif [ -t 0 ]; then _ask -rsp "$(_t "解密密码: " "L_ASK_PASSWD")" PASS; echo
+  else echo "$(_t "非交互模式需要密码：用 --password 或 OCI_CN_PASS 环境变量提供" "L_NEED_PASS")"; exit 1; fi
+  unlock
+  prepare_runtime
+}
+# 跨账号/区域定位实例，命中设置 ACC_NAME/TENANCY/OCI_REGION/OCI_CFG/SEL_ID/SEL_NAME/SEL_AD
+_cli_locate_instance(){  # $1=关键字 $2=账号名(可空) $3=区域(可空)
+  local kw="$1" acc="$2" region="$3"
+  echo "$(_t "查找实例: %s ..." "L_CLI_SEARCHING" "$kw")"
+  local found=0
+  while IFS=$'\t' read -r name tenancy _u _f home _tn _pl _st; do
+    [ -z "$name" ] && continue
+    [ -n "$acc" ] && [ "$name" != "$acc" ] && continue
+    [ "$home" = - ] && home=""
+    if _cli_find_instance "$name" "$tenancy" "$home" "$region" "$kw"; then found=1; break; fi
+  done < "$ACC_FILE"
+  [ "$found" = 0 ] && { echo "$(_t "未找到实例: %s" "L_CLI_NOT_FOUND" "$kw")"; return 1; }
+  echo "$(_t "账号：%s  区域：%s  实例：%s" "L_CLI_FOUND" "$ACC_NAME" "$OCI_REGION" "$SEL_NAME")"
+  OCI_CFG=$(oci_cfg "$ACC_NAME" "$OCI_REGION")
+  return 0
+}
+# 取实例所在子网的第一个安全列表 -> SEL_SLID/SEL_SLNAME
+_cli_first_seclist(){
+  local sid; sid=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output 2>/dev/null)
+  local ids; ids=$(o network subnet get --subnet-id "$sid" --query 'data."security-list-ids"' 2>/dev/null | jq -r '.[]')
+  SEL_SLID=$(echo "$ids" | head -1)
+  [ -z "$SEL_SLID" ] && { echo "$(_t "子网未绑定安全列表" "L_CLI_NO_SECLIST")"; return 1; }
+  SEL_SLNAME=$(o network security-list get --security-list-id "$SEL_SLID" --query 'data."display-name"' --raw-output 2>/dev/null)
+  return 0
+}
+# 拼一条入站规则 JSON：$1=proto(tcp|udp|icmp|all) $2=端口(443 或 8000-8100；icmp/all 忽略)
+_cli_rule_json(){
+  local proto="$1" spec="$2" pmin pmax
+  case "$proto" in
+    tcp|udp)
+      if [[ "$spec" == *-* ]]; then pmin="${spec%-*}"; pmax="${spec#*-}"; else pmin="$spec"; pmax="$spec"; fi
+      _is_int "$pmin" && _is_int "$pmax" && [ "$pmin" -ge 1 ] && [ "$pmax" -le 65535 ] && [ "$pmin" -le "$pmax" ] || return 1
+      if [ "$proto" = udp ]; then
+        printf '{"protocol":"17","source":"0.0.0.0/0","isStateless":false,"udpOptions":{"destinationPortRange":{"min":%s,"max":%s}}}' "$pmin" "$pmax"
+      else
+        printf '{"protocol":"6","source":"0.0.0.0/0","isStateless":false,"tcpOptions":{"destinationPortRange":{"min":%s,"max":%s}}}' "$pmin" "$pmax"
+      fi;;
+    icmp) printf '{"protocol":"1","source":"0.0.0.0/0","isStateless":false}';;
+    all)  printf '{"protocol":"all","source":"0.0.0.0/0","isStateless":false}';;
+    *) return 1;;
+  esac
+}
+# CLI：开放端口
+cli_open_port(){
+  local inst="" acc="" region="" pw="${OCI_CN_PASS:-}" proto="" port="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance) inst="$2"; shift 2;; --account) acc="$2"; shift 2;;
+      --region) region="$2"; shift 2;; --password) echo "$(_t "警告：--password 会暴露在进程列表，请改用 OCI_CN_PASS 环境变量" "L_PW_WARN")"; pw="$2"; shift 2;;
+      --protocol) proto="$(printf '%s' "$2" | tr 'A-Z' 'a-z')"; shift 2;;
+      --open-port) port="$2"; shift 2;; --yes) yes=1; shift;;
+      -h|--help) cli_usage; exit 0;;
+      *) echo "$(_t "未知参数: $1" "L_UNKNOWN_ARG")"; cli_usage; exit 1;;
+    esac
+  done
+  [ -z "$inst" ] && { echo "$(_t "缺少 --instance 参数" "L_MISSING_INST")"; cli_usage; exit 1; }
+  [ -z "$proto" ] && { echo "$(_t "--open-port 需要 --protocol tcp/udp/icmp/all" "L_CLI_OPEN_NEED")"; cli_usage; exit 1; }
+  local newrule; newrule=$(_cli_rule_json "$proto" "$port") || { echo "$(_t "端口无效: %s（用 443 或 8000-8100）" "L_CLI_INVALID_PORT" "$port")"; exit 1; }
+  _cli_auth "$pw"
+  _cli_locate_instance "$inst" "$acc" "$region" || exit 1
+  _cli_first_seclist || exit 1
+  local cur merged n
+  cur=$(o network security-list get --security-list-id "$SEL_SLID" --query 'data."ingress-security-rules"' 2>/dev/null)
+  merged=$(echo "$cur" | jq -c ". + [$newrule]")
+  n=$(echo "$merged" | jq 'length' 2>/dev/null || echo "?")
+  echo "$(_t "安全列表：%s" "L_CLI_SECLIST" "$SEL_SLNAME")"
+  echo "$(_t "当前入站规则：" "L_CUR_RULES")"; echo "$cur" | _fmt_rules
+  echo "$(_t "将开放 %s %s（来源0.0.0.0/0），执行后将变为（共 %s 条）：" "L_CLI_AFTER_OPEN" "$proto" "$port" "$n")"
+  echo "$merged" | _fmt_rules
+  if [ "$yes" != 1 ]; then echo "$(_t "未加 --yes，仅预览，未执行任何变更。" "L_CLI_DRYRUN")"; exit 0; fi
+  local out; out=$(o network security-list update --security-list-id "$SEL_SLID" --ingress-security-rules "$merged" --force 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$(_t "已开放 %s %s" "L_CLI_OPEN_DONE" "$proto" "$port")"
+    notify "开放端口成功" "$SEL_NAME" "端口：$proto $port" "状态：已生效，当前入站规则 $(_sl_count "$SEL_SLID") 条"
+  else
+    echo "$(_t "失败：" "L_FAILED")$(_oci_err "$out")"
+    notify "开放端口失败" "$SEL_NAME" "端口：$proto $port" "原因：$(_oci_err "$out")"; exit 1
+  fi
+}
+# CLI：关闭端口（按规则编号）
+cli_close_port(){
+  local inst="" acc="" region="" pw="${OCI_CN_PASS:-}" nums="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance) inst="$2"; shift 2;; --account) acc="$2"; shift 2;;
+      --region) region="$2"; shift 2;; --password) echo "$(_t "警告：--password 会暴露在进程列表，请改用 OCI_CN_PASS 环境变量" "L_PW_WARN")"; pw="$2"; shift 2;;
+      --close-port) nums="$2"; shift 2;; --yes) yes=1; shift;;
+      -h|--help) cli_usage; exit 0;;
+      *) echo "$(_t "未知参数: $1" "L_UNKNOWN_ARG")"; cli_usage; exit 1;;
+    esac
+  done
+  [ -z "$inst" ] && { echo "$(_t "缺少 --instance 参数" "L_MISSING_INST")"; cli_usage; exit 1; }
+  [ -z "$nums" ] && { echo "$(_t "--close-port 需要规则编号，如 --close-port 0" "L_CLI_CLOSE_NEED")"; cli_usage; exit 1; }
+  _cli_auth "$pw"
+  _cli_locate_instance "$inst" "$acc" "$region" || exit 1
+  _cli_first_seclist || exit 1
+  local cur; cur=$(o network security-list get --security-list-id "$SEL_SLID" --query 'data."ingress-security-rules"' 2>/dev/null)
+  local total; total=$(echo "$cur" | jq 'length' 2>/dev/null || echo 0)
+  for n in $nums; do
+    _is_int "$n" && [ "$n" -lt "$total" ] || { echo "$(_t "规则编号无效: %s" "L_CLI_INVALID_NUM" "$n")"; exit 1; }
+  done
+  echo "$(_t "安全列表：%s" "L_CLI_SECLIST" "$SEL_SLNAME")"
+  _show_rules "$SEL_SLID"
+  local delexpr="["; for n in $nums; do delexpr+="$n,"; done; delexpr="${delexpr%,}]"
+  local merged; merged=$(echo "$cur" | jq -c "del(.[$delexpr[]])" 2>/dev/null)
+  [ -z "$merged" ] && { echo "$(_t "规则编号无效" "L_CLI_INVALID_NUM")"; exit 1; }
+  local n; n=$(echo "$merged" | jq 'length' 2>/dev/null || echo "?")
+  echo "$(_t "将删除规则编号：%s，删除后将变为（剩余 %s 条）：" "L_CLI_AFTER_DEL" "$nums" "$n")"
+  echo "$merged" | _fmt_rules
+  if [ "$yes" != 1 ]; then echo "$(_t "未加 --yes，仅预览，未执行任何变更。" "L_CLI_DRYRUN")"; exit 0; fi
+  local out; out=$(o network security-list update --security-list-id "$SEL_SLID" --ingress-security-rules "$merged" --force 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$(_t "已删除。" "L_DELETED")"
+    notify "关闭端口成功" "$SEL_NAME" "已删除规则编号：$nums" "状态：已生效，当前入站规则 $(_sl_count "$SEL_SLID") 条"
+  else
+    echo "$(_t "失败：" "L_FAILED")$(_oci_err "$out")"
+    notify "关闭端口失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; exit 1
+  fi
+}
+# CLI：删除全部规则，按给定端口列表重建
+cli_replace_all(){
+  local inst="" acc="" region="" pw="${OCI_CN_PASS:-}" ports="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance) inst="$2"; shift 2;; --account) acc="$2"; shift 2;;
+      --region) region="$2"; shift 2;; --password) echo "$(_t "警告：--password 会暴露在进程列表，请改用 OCI_CN_PASS 环境变量" "L_PW_WARN")"; pw="$2"; shift 2;;
+      --ports) ports="$2"; shift 2;; --replace-all) shift;;
+      --yes) yes=1; shift;; -h|--help) cli_usage; exit 0;;
+      *) echo "$(_t "未知参数: $1" "L_UNKNOWN_ARG")"; cli_usage; exit 1;;
+    esac
+  done
+  [ -z "$inst" ] && { echo "$(_t "缺少 --instance 参数" "L_MISSING_INST")"; cli_usage; exit 1; }
+  [ -z "$ports" ] && { echo "$(_t "--replace-all 需要 --ports，如 \"22/tcp,6700/tcp\"" "L_CLI_PORTS_REQ")"; cli_usage; exit 1; }
+  _cli_auth "$pw"
+  _cli_locate_instance "$inst" "$acc" "$region" || exit 1
+  _cli_first_seclist || exit 1
+  local oldifs="$IFS"; IFS=','; local -a entries=($ports); IFS="$oldifs"
+  local -a rules=(); local e pp pr rule
+  for e in "${entries[@]}"; do
+    e="${e// /}"
+    [ -z "$e" ] && continue
+    if [[ "$e" == */* ]]; then pp="${e%%/*}"; pr="${e##*/}"; else pp="$e"; pr=""; fi
+    pr=$(printf '%s' "$pr" | tr 'A-Z' 'a-z')
+    if [ -z "$pr" ]; then
+      if [ "$pp" = icmp ] || [ "$pp" = all ]; then pr="$pp"; pp=""; else pr="tcp"; fi
+    fi
+    rule=$(_cli_rule_json "$pr" "$pp") || { echo "$(_t "端口项无效: %s" "L_CLI_INVALID_PORT" "$e")"; exit 1; }
+    rules+=("$rule")
+  done
+  [ "${#rules[@]}" -eq 0 ] && { echo "$(_t "--replace-all 需要 --ports" "L_CLI_PORTS_REQ")"; exit 1; }
+  local cur merged n old_n
+  cur=$(o network security-list get --security-list-id "$SEL_SLID" --query 'data."ingress-security-rules"' 2>/dev/null)
+  old_n=$(echo "$cur" | jq 'length' 2>/dev/null || echo "?")
+  merged=$(printf '%s\n' "${rules[@]}" | jq -c -s '.')
+  n=$(echo "$merged" | jq 'length' 2>/dev/null || echo "?")
+  echo "$(_t "安全列表：%s" "L_CLI_SECLIST" "$SEL_SLNAME")"
+  echo "$(_t "当前入站规则（%s 条，将被整体替换）：" "L_CLI_CUR_N" "$old_n")"; echo "$cur" | _fmt_rules
+  echo "$(_t "替换后将变为（共 %s 条）：" "L_CLI_AFTER_REPLACE" "$n")"
+  echo "$merged" | _fmt_rules
+  if [ "$yes" != 1 ]; then echo "$(_t "未加 --yes，仅预览，未执行任何变更。" "L_CLI_DRYRUN")"; exit 0; fi
+  local out; out=$(o network security-list update --security-list-id "$SEL_SLID" --ingress-security-rules "$merged" --force 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$(_t "已替换全部规则。" "L_CLI_REPLACE_DONE")"
+    notify "替换全部规则成功" "$SEL_NAME" "原 $old_n 条 → 现 $n 条" "状态：已生效，当前入站规则 $(_sl_count "$SEL_SLID") 条"
+  else
+    echo "$(_t "失败：" "L_FAILED")$(_oci_err "$out")"
+    notify "替换全部规则失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; exit 1
+  fi
+}
+cli_list_rules(){
+  local inst="" acc="" region="" pw="${OCI_CN_PASS:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance) inst="$2"; shift 2;;
+      --account) acc="$2"; shift 2;;
+      --region) region="$2"; shift 2;;
+      --password) pw="$2"; shift 2;;
+      -h|--help) cli_usage; exit 0;;
+      *) echo "$(_t "未知参数: $1" "L_UNKNOWN_ARG")"; cli_usage; exit 1;;
+    esac
+  done
+  [ -z "$inst" ] && { echo "$(_t "缺少 --instance 参数" "L_MISSING_INST")"; cli_usage; exit 1; }
+  _cli_auth "$pw"
+  _cli_locate_instance "$inst" "$acc" "$region" || exit 1
+  _show_effective
+}
+
+main(){
+  unlock; prepare_runtime
+  while true; do
+    echo; line; printf "  $(_t "oci-cn v%s  —  甲骨文云中文管理" "L_MAIN_TITLE" "$VERSION")\n" "$VERSION"; line
+    echo " $(_t "1 配置列表（进入账号）" "L_MENU_ACCOUNT")"; echo " $(_t "2 系统配置" "L_MENU_SYSTEM")"; echo " $(_t "0 退出" "L_MENU_EXIT")"
+    _ask -rp "$(_t "选择" "L_CHOOSE"): " m
+    case "$m" in
+      1) list_accounts || { pause; continue; }; _ask -rp "$(_t "账号编号" "L_CHOOSE"): " idx; row=$(get_account_by_index "$idx"); [ -z "$row" ] && { echo "$(_t "无效" "L_INVALID")"; continue; }; account_page "$row";;
+      2) sys_menu;;
+      0) echo "$(_t "已清除内存密钥。再见。" "L_GOODBYE")"; exit 0;;
+    esac
+  done
+}
+
+# CLI 参数入口（非交互模式不进菜单）
+case "$1" in
+  --list-rules)  shift; cli_list_rules "$@"; exit $?;;
+  --open-port)   _v="$2"; shift 2; cli_open_port --open-port "$_v" "$@"; exit $?;;
+  --close-port)  _v="$2"; shift 2; cli_close_port --close-port "$_v" "$@"; exit $?;;
+  --replace-all) shift; cli_replace_all "$@"; exit $?;;
+  --daily-billing-tick) [ ! -f "${OCI_CN_HOME:-$HOME/.oci-cn}/.nopass" ] && [ -n "$OCI_CN_PASS" ] && PASS="$OCI_CN_PASS"; unlock; prepare_runtime; billing_tick; exit $?;;
+  --tenant-check) [ ! -f "${OCI_CN_HOME:-$HOME/.oci-cn}/.nopass" ] && [ -n "$OCI_CN_PASS" ] && PASS="$OCI_CN_PASS"; unlock; prepare_runtime; verify_usability "$2"; exit $?;;
+esac
+# 安全巡检菜单
+security_inspection_menu(){
+  while true; do
+    echo
+    echo "── 安全巡检 ──"
+    echo " 1批量查询所有实例端口规则"
+    echo " 2只查不合格项（全端口开放）"
+    echo " 0返回"
+    local x; _ask -rp "选择: " x
+    case "$x" in
+      1) batch_list_rules "all"; pause;;
+      2) batch_list_rules "bad_only"; pause;;
+      0) return;;
+    esac
+  done
+}
+
+# 批量查询所有租户实例的端口规则（v6.10.0 重写）
+# $1 = all|bad_only   all=列出全部实例全部入站规则并推送全部；bad_only=只列全端口开放项
+# 修复：旧版用空密码解密密钥 + 硬编码区域 + 误解析 raw-output JSON，导致全部查询静默失败、报告为空却显示“全部合格”
+_rules_fmt_py='
+import json, sys, os
+try:
+  rules = json.load(sys.stdin) or []
+except Exception:
+  rules = None
+mode = os.environ.get("MODE","all")
+def prange(o):
+  d = (o or {}).get("destination-port-range") or {}
+  if not d: return "全部"
+  a, b = d.get("min"), d.get("max")
+  return str(a) if a == b else "%s-%s" % (a, b)
+def bad(r):
+  if r.get("source") not in ("0.0.0.0/0", "::/0"): return False
+  p = r.get("protocol","")
+  if p == "all": return True
+  if p == "6": return not ((r.get("tcp-options") or {}).get("destination-port-range"))
+  if p == "17": return not ((r.get("udp-options") or {}).get("destination-port-range"))
+  return False
+hdr = "#### %s ｜ %s\n- 实例：%s\n- 安全列表：%s" % (os.environ["T"], os.environ["R"], os.environ["I"], os.environ["S"])
+if rules is None:
+  if mode == "all": print(hdr + "\n- ❓ 规则读取失败\n")
+  sys.exit(0)
+is_bad = any(bad(r) for r in rules)
+if mode == "bad_only" and not is_bad: sys.exit(0)
+names = {"6":"TCP","17":"UDP","1":"ICMP","58":"ICMPv6","all":"ALL"}
+out = [hdr]
+if not rules: out.append("- （无入站规则）")
+for r in rules:
+  p = r.get("protocol","")
+  pn = names.get(p, "协议"+p)
+  if p == "6": port = prange(r.get("tcp-options"))
+  elif p == "17": port = prange(r.get("udp-options"))
+  elif p in ("1","58"):
+    io = r.get("icmp-options") or {}
+    port = ("type %s" % io.get("type")) if io else "全部"
+  else: port = "全部"
+  mark = " ⚠️" if bad(r) else ""
+  out.append("- %s %s ← %s%s" % (pn, port, r.get("source",""), mark))
+if is_bad: out.append("- **⚠️ 不合格：全端口开放！**")
+out.append("")
+print("\n".join(out))
+'
+batch_list_rules(){
+  local mode="$1"
+  prepare_runtime
+  local total; total=$(awk -F'\t' 'NF&&$1!=""' "$ACC_FILE" | wc -l)
+  echo "正在查询 $total 个租户的安全列表..."
+  local tmpdir; tmpdir=$(mktemp -d /dev/shm/batchsl.XXXXXX)
+  local report_file="$tmpdir/report.txt" err_file="$tmpdir/err.txt" cnt_file="$tmpdir/cnt"
+  : > "$report_file"; : > "$err_file"; : > "$cnt_file"
+  local idx=0 tname tenancy _u _f home _rest
+  while IFS=$'\t' read -r tname tenancy _u _f home _rest; do
+    [ -z "$tname" ] && continue
+    idx=$((idx+1))
+    echo "[$idx/$total] 正在查 $tname..."
+    if [ ! -s "$RUN_DIR/$tname.pem" ]; then echo "  ✗ 密钥不可用（未解锁或解密失败）"; echo "$tname：密钥不可用" >> "$err_file"; continue; fi
+    local regions="" r cfg
+    cfg=$(oci_cfg "$tname" "${home:-us-ashburn-1}")
+    regions=$(oci --config-file "$cfg" --region "${home:-us-ashburn-1}" iam region-subscription list --tenancy-id "$tenancy" \
+      --query 'data[]."region-name"' 2>/dev/null | jq -r '.[]?' 2>/dev/null)
+    [ -z "$regions" ] && regions="$home"
+    [ -z "$regions" ] && { echo "  ✗ 无法确定区域"; echo "$tname：无法确定区域" >> "$err_file"; continue; }
+    for r in $regions; do
+      local insts
+      if ! insts=$(oci --config-file "$cfg" --region "$r" compute instance list -c "$tenancy" --all \
+          --query 'data[?"lifecycle-state"!=`"TERMINATED"`].[id,"display-name"]' 2>/dev/null | jq -r '.[]?|@tsv' 2>/dev/null); then
+        echo "  ✗ $r 实例列表读取失败"; echo "$tname/$r：实例列表读取失败" >> "$err_file"; continue
+      fi
+      local iid iname
+      while IFS=$'\t' read -r iid iname; do
+        [ -z "$iid" ] && continue
+        echo x >> "$cnt_file"
+        local subnet
+        subnet=$(oci --config-file "$cfg" --region "$r" compute instance list-vnics --instance-id "$iid" \
+          --query 'data[?"is-primary"]|[0]."subnet-id"' --raw-output 2>/dev/null)
+        if [ -z "$subnet" ] || [ "$subnet" = null ]; then
+          [ "$mode" = all ] && printf '#### %s ｜ %s\n- 实例：%s\n- ❓ 无法读取子网\n\n' "$tname" "$r" "$iname" >> "$report_file"
+          continue
+        fi
+        local sjson slids slid
+        sjson=$(oci --config-file "$cfg" --region "$r" network subnet get --subnet-id "$subnet" 2>/dev/null)
+        slids=$(echo "$sjson" | jq -r '.data."security-list-ids"[]?' 2>/dev/null)
+        for slid in $slids; do
+          local sl sname
+          sl=$(oci --config-file "$cfg" --region "$r" network security-list get --security-list-id "$slid" 2>/dev/null)
+          sname=$(echo "$sl" | jq -r '.data."display-name" // "?"' 2>/dev/null)
+          echo "$sl" | jq '.data."ingress-security-rules"' 2>/dev/null \
+            | MODE="$mode" T="$tname" R="$r" I="$iname" S="$sname" python3 -c "$_rules_fmt_py" >> "$report_file" 2>/dev/null
+        done
+      done <<< "$insts"
+    done
+  done < "$ACC_FILE"
+
+  local ninst; ninst=$(wc -l < "$cnt_file")
+  local summary="共 $idx 个租户、$ninst 台实例"
+  [ -s "$err_file" ] && summary="$summary；$(wc -l < "$err_file") 项查询失败"
+  echo; echo "查询完成（$summary）"
+  [ -s "$err_file" ] && { echo "查询失败："; sed 's/^/  /' "$err_file"; }
+  if [ -s "$report_file" ]; then
+    cat "$report_file"
+  elif [ "$ninst" -gt 0 ] && [ "$mode" = bad_only ]; then
+    echo "✅ 所有实例端口规则均合格，无全端口开放项"
+  else
+    echo "⚠️ 未查到任何实例规则（请检查密钥/网络）"
+  fi
+
+  echo
+  _ask -rp "是否推送到钉钉？(y/n): " yn
+  if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
+    local title="OCI端口规则巡检报告"; [ "$mode" = all ] && title="OCI全部端口规则"
+    local head="## $title"$'\n\n'"$summary"$'\n\n'
+    [ -s "$err_file" ] && head+="查询失败："$'\n'"$(sed 's/^/- /' "$err_file")"$'\n\n'
+    if [ ! -s "$report_file" ]; then
+      if [ "$ninst" -gt 0 ] && [ "$mode" = bad_only ]; then body="✅ 所有实例端口规则均合格，无全端口开放项"; else body="⚠️ 未查到任何实例规则（请检查密钥/网络）"; fi
+      dingtalk_push "$title" "$head$body"$'\n\n'"时间：$(bj_time)" && echo "已推送" || echo "推送失败，请检查钉钉配置"
+    else
+      # 按实例块切分，每条不超过约 3500 字符
+      local parts; parts=$(python3 - "$report_file" "$tmpdir/part" <<'PY'
+import sys
+blocks=[b for b in open(sys.argv[1],encoding="utf-8").read().split("\n\n") if b.strip()]
+parts=[];cur=""
+for b in blocks:
+  if cur and len(cur)+len(b)>3500: parts.append(cur);cur=""
+  cur+=b+"\n\n"
+if cur: parts.append(cur)
+for i,p in enumerate(parts,1): open("%s.%d"%(sys.argv[2],i),"w",encoding="utf-8").write(p)
+print(len(parts))
+PY
+)
+      local i ok=1
+      for ((i=1;i<=parts;i++)); do
+        local txt; txt=$(cat "$tmpdir/part.$i")
+        local h=""; [ "$i" = 1 ] && h="$head"
+        dingtalk_push "$title ($i/$parts)" "## $title ($i/$parts)"$'\n\n'"${h#\#\# $title$'\n\n'}$txt"$'\n'"时间：$(bj_time)" || ok=0
+        [ "$i" -lt "$parts" ] && sleep 1
+      done
+      [ "$ok" = 1 ] && echo "已推送（$parts 条）" || echo "部分推送失败，请检查钉钉配置"
+    fi
+  fi
+  rm -rf "$tmpdir"
+}
+main
