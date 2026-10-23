@@ -5,7 +5,7 @@
 set -o pipefail
 umask 077
 
-VERSION="6.10.2"
+VERSION="6.10.3"
 
 # 全局关闭 oci 的文件权限警告，否则它会混进 stdout 冲垮 jq
 export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
@@ -1168,7 +1168,54 @@ bv_perf(){
   if [ "$now" = "$vpu" ]; then echo "$(_t "已生效：VPU %s" "L_VPU_DONE" "$now")"; notify "引导卷性能" "$SEL_NAME" "变更：VPU$old → VPU$now" "状态：已生效"
   else echo "$(_t "已提交但当前仍为 VPU %s，稍后确认。" "L_VPU_PENDING" "$now")"; notify "引导卷性能失败" "$SEL_NAME" "原因：提交后仍为 VPU$now"; fi
 }
-bv_shrink(){ echo "缩硬盘：新建 47GB 引导卷替换，原数据不保留，需分离/挂回，风险高。"; echo "当前版本暂不自动执行，建议控制台 Cloud Shell 手动操作。"; }
+bv_shrink(){
+  # 替换引导卷缩小（2026-10-24 新增，经验来自 2026-10-22 伦敦/巴黎实测）：
+  # 正路只有一条——对原实例 instance update --source-details 换盘，旧盘自动删、实例/IP/VNIC 不变。
+  # 不要走"造新盘再 attach 挂回"的路：attach_boot_volume 对非父实例一律 409，倒不了盘（实测三路全拒）。
+  # --update-operation-constraint ALLOW_DOWNTIME 绝不能漏：漏了 update 会无限假死、云端零动静（实测 16~45 分钟无返回），
+  # 此时绝不能断开重发，等它带约束一次到位。变异命令输出不许截断，成败一律靠状态回读确认，不看命令自报。
+  bv_get || return
+  local old; old=$(o bv boot-volume get --boot-volume-id "$BV_ID" --query 'data."size-in-gbs"' --raw-output 2>/dev/null)
+  local st0; st0=$(_inst_state "$SEL_ID")
+  local img; img=$(o compute instance get --instance-id "$SEL_ID" 2>/dev/null | jq -r '.data."source-details"."image-id" // empty')
+  [ -z "$img" ] && { echo "$(_t "读取实例当前镜像失败，已取消。" "L_SHRINK_NOIMG")"; return; }
+  local imgnm; imgnm=$(o compute image get --image-id "$img" --query 'data."display-name"' --raw-output 2>/dev/null)
+  echo "$(_t "%s 当前引导卷：%sGB，当前镜像：%s" "L_SHRINK_TITLE" "$SEL_NAME" "$old" "${imgnm:-$img}")"
+  echo "$(_t "原理：用当前镜像新做一块小盘替换上去（旧盘自动删除），实例、公网IP、VNIC 都不变。" "L_SHRINK_HOW")"
+  echo "$(_t "⚠️ 替换等于重装系统：盘内数据全部清空、不可恢复；过程会停机；新盘首启会重跑 user_data，原密码/SSH 设置照旧。" "L_SHRINK_WARN")"
+  local sz; _askc "$(_t "缩小到 GB（最小50）" "L_SHRINK_TO")" sz || return
+  _is_int "$sz" || { echo "必须是整数"; return; }
+  [ "$sz" -ge 50 ] || { echo "$(_t "不能小于 50GB（甲骨文引导卷最小规格）。" "L_SHRINK_MIN")"; return; }
+  [ "$sz" -lt "$old" ] || { echo "$(_t "必须小于当前 %sGB；同大小或更大请用菜单 2 扩容（不丢数据）。" "L_SHRINK_LESS" "$old")"; return; }
+  _confirm "$(_t "确认给 %s 替换引导卷 %sGB → %sGB？数据全部清空、不可逆" "L_SHRINK_CONFIRM" "$SEL_NAME" "$old" "$sz")" || return
+  local c; _ask -rp "$(_t "请输 yes 再次确认: " "L_SHRINK_YES")" c; [ "$c" = yes ] || { echo "$(_t "已取消" "L_CANCELLED")"; return; }
+  echo "$(_t "正在替换引导卷（会停机，请勿中断、切勿重复执行）..." "L_SHRINK_DOING")"
+  local sd="{\"sourceType\":\"image\",\"imageId\":\"$img\",\"bootVolumeSizeInGBs\":$sz,\"isPreserveBootVolumeEnabled\":false}"
+  local out; out=$(o compute instance update --instance-id "$SEL_ID" --force --source-details "$sd" --update-operation-constraint ALLOW_DOWNTIME 2>&1) || { echo "失败：$(_oci_err "$out")"; notify "引导卷缩小失败" "$SEL_NAME" "原因：$(_oci_err "$out")"; return; }
+  echo "$(_t "已提交，等待实例恢复并挂载新盘确认（最长约15分钟）..." "L_SHRINK_WAIT")"
+  # 成功标准（状态回读，两者同时成立）：新盘大小==目标 且 实例回到替换前应有的电源状态。替换中途附件可能短暂为空，继续等。
+  local ok="" tries=0 started="" st="" cur="" csz=""
+  while [ $tries -lt 60 ]; do
+    st=$(_inst_state "$SEL_ID")
+    cur=$(o compute boot-volume-attachment list -c "$TENANCY" --availability-domain "$SEL_AD" --instance-id "$SEL_ID" --query 'data[0]."boot-volume-id"' --raw-output 2>/dev/null)
+    csz=""; [ -n "$cur" ] && csz=$(o bv boot-volume get --boot-volume-id "$cur" --query 'data."size-in-gbs"' --raw-output 2>/dev/null)
+    if [ "$csz" = "$sz" ] && { [ "$st" = "RUNNING" ] || { [ "$st0" != "RUNNING" ] && [ "$st" = "STOPPED" ]; }; }; then ok=1; break; fi
+    # 替换前是运行中的，换完没自动开机就拉起来（runbook 定式）；替换前关着的保持关着，不擅自开机。
+    if [ "$st0" = "RUNNING" ] && [ "$st" = "STOPPED" ] && [ "$csz" = "$sz" ] && [ -z "$started" ]; then
+      started=1; o compute instance action --instance-id "$SEL_ID" --action START >/dev/null 2>&1
+    fi
+    printf "."; sleep 15; tries=$((tries+1))
+  done
+  echo
+  if [ -n "$ok" ]; then
+    local ip; ip=$(o compute instance list-vnics --instance-id "$SEL_ID" --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+    echo "$(_t "✅ 已完成：%s 引导卷 %sGB → %sGB，实例状态 %s，公网IP %s" "L_SHRINK_OK" "$SEL_NAME" "$old" "$sz" "$st" "${ip:--}")"
+    notify "引导卷缩小（替换）" "$SEL_NAME" "变更：${old}GB → ${sz}GB（旧盘已删）" "状态：$st" "公网IP：${ip:-（无）}"
+  else
+    echo "$(_t "已提交但15分钟内未确认完成（当前状态 %s、新盘 %sGB）。请稍后在「引导卷→查看」确认，切勿重复执行替换。" "L_SHRINK_PENDING" "${st:-未知}" "${csz:-未知}")"
+    notify "引导卷缩小未确认" "$SEL_NAME" "原因：15分钟内未确认完成，当前状态 ${st:-未知}、新盘 ${csz:-未知}GB" "提示：稍后在引导卷查看确认，勿重复执行"
+  fi
+}
 
 # ============ 流量/配额/成本 ============
 _fmt_bytes(){ awk -v b="$1" 'BEGIN{ if(b>=1073741824) printf "%.2f GB", b/1073741824; else printf "%.2f MB", b/1048576 }'; }
@@ -1861,7 +1908,7 @@ EOF
   if [ $? -eq 0 ]; then echo "$(_t "已卸载，该卷现在为未挂载状态（可用 7 删除停止计费）。" "L_DETACHED")"; _push_acct "🔌" "卸载块存储卷" "区域：$OCI_REGION" "卷：${ANM[$x]}" "实例：${AIN[$x]}" "状态：DETACHED（已卸载，未删除仍计费）"
   else echo "失败：$(_oci_err "$out")"; _push_acct "❌" "卸载块存储卷失败" "区域：$OCI_REGION" "卷：${ANM[$x]}" "原因：$(_oci_err "$out")"; fi
 }
-bv_menu(){ while true; do echo; echo "$(_t "── 引导卷 / 存储 ──" "L_VOL_TITLE")"; echo " 1查看 2扩容 3调性能 4缩硬盘"; echo " 5全部盘(含未挂载) 6新建块存储卷 7删除未挂载的盘"; echo " 8挂载块存储卷 9卸载块存储卷 0返回"; _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x; case "$x" in 8)disk_attach;pause;; 9)disk_detach;pause;; 1)bv_list;pause;; 2)bv_expand;pause;; 3)bv_perf;pause;; 4)bv_shrink;pause;; 5)disk_scan_all;pause;; 6)disk_create;pause;; 7)disk_delete_free;pause;; 0)return;; esac; done; }
+bv_menu(){ while true; do echo; echo "$(_t "── 引导卷 / 存储 ──" "L_VOL_TITLE")"; echo " 1查看 2扩容 3调性能 4缩小(替换引导卷)"; echo " 5全部盘(含未挂载) 6新建块存储卷 7删除未挂载的盘"; echo " 8挂载块存储卷 9卸载块存储卷 0返回"; _ask -rp "$(_t "选择: " "L_ASK_CHOOSE")" x; case "$x" in 8)disk_attach;pause;; 9)disk_detach;pause;; 1)bv_list;pause;; 2)bv_expand;pause;; 3)bv_perf;pause;; 4)bv_shrink;pause;; 5)disk_scan_all;pause;; 6)disk_create;pause;; 7)disk_delete_free;pause;; 0)return;; esac; done; }
 # ============ 虚拟云网络：新建子网 ============
 # 简单校验 CIDR 格式（x.x.x.x/y）
 _valid_cidr(){
