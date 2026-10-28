@@ -5,7 +5,7 @@
 set -o pipefail
 umask 077
 
-VERSION="6.10.6"
+VERSION="6.10.7"
 
 # 全局关闭 oci 的文件权限警告，否则它会混进 stdout 冲垮 jq
 export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
@@ -598,16 +598,15 @@ view_api_config(){
     echo "$(_t "⚠ 找不到本地私钥（无 .pem / 解密失败）" "L_NO_LOCAL_KEY")"
   fi
   echo
-  echo "── $(_t "OCI 配置（官方格式）" "L_OCI_CFG_OFFICIAL") ──"
-  # 官方文档字段顺序：user → fingerprint → key_file → tenancy → region
-  # key_file 用官方示例占位路径，便于直接对照文档/粘贴；本机真实路径在块外另注
+  echo "── $(_t "OCI 配置（控制台导出格式）" "L_OCI_CFG_OFFICIAL") ──"
+  # 与 OCI 控制台「下载配置」一致：user → fingerprint → tenancy → region → key_file
   cat <<EOF
 [DEFAULT]
 user=$user
 fingerprint=$fp
-key_file=~/.oci/oci_api_key.pem
 tenancy=$tenancy
 region=$r
+key_file=<path to your private keyfile> # TODO
 EOF
   if [ -n "$local_key_path" ]; then
     echo "$(_t "本机私钥路径（供对照，非配置字段）：%s" "L_LOCAL_KEY_PATH" "$local_key_path")"
