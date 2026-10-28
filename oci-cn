@@ -5,7 +5,7 @@
 set -o pipefail
 umask 077
 
-VERSION="6.10.4"
+VERSION="6.10.5"
 
 # 全局关闭 oci 的文件权限警告，否则它会混进 stdout 冲垮 jq
 export OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
@@ -575,22 +575,42 @@ view_api_config(){
   _askc "$(_t "查看编号" "L_VIEW_NUM")" idx || return
   row=$(get_account_by_index "$idx"); [ -z "$row" ] && { echo "$(_t "无效" "L_INVALID")"; return; }
   IFS=$'\t' read -r name tenancy user fp home tname plan status <<< "$row"
-  local kp local_fp pub cloud=""
-  echo
-  line
-  echo "$(_t "账号" "L_ACCT"): $name"
-  echo "tenancy: $tenancy"
-  echo "user:    $user"
-  echo "$(_t "配置指纹" "L_CFG_FP"): $fp"
-  echo "$(_t "主区域" "L_HOME_REGION"): ${home:--}"
-  echo "$(_t "租户名" "L_TENANT_NAME"): ${tname:--}  $(_t "套餐" "L_PLAN"): ${plan:--}  $(_t "状态" "L_STATUS"): ${status:--}"
+  local kp local_fp pub cloud="" key_note r
+  r="$home"; [ "$r" = - ] && r=""; [ -z "$r" ] && r=$(name_to_region "$name")
+  [ -z "$r" ] && r="us-ashburn-1"
+  kp=""; key_note="(私钥不可用)"
   if kp=$(_acct_privkey_path "$name"); then
-    local_fp=$(_oci_fp_from_file "$kp") || local_fp=""
-    echo "$(_t "本地私钥指纹" "L_LOCAL_FP"): ${local_fp:-（计算失败）}"
-    if [ -n "$local_fp" ] && [ -n "$fp" ] && [ "$local_fp" != "$(_oci_fp_normalize "$fp")" ]; then
-      echo "$(_t "⚠ 本地私钥指纹与 accounts.tsv 配置指纹不一致" "L_FP_MISMATCH")"
+    # 展示用路径：优先持久 keys 目录，否则运行时解密路径
+    if [ -f "$HOME_DIR/.nopass" ] && [ -s "$KEYS_DIR/$name.pem" ]; then
+      key_note="$KEYS_DIR/$name.pem"
+    elif [ -f "$KEYS_DIR/$name.pem.enc" ]; then
+      key_note="$KEYS_DIR/$name.pem.enc → 运行时解密"
+    else
+      key_note="$kp"
     fi
-    echo
+  fi
+  echo
+  echo "$(_t "账号" "L_ACCT"): $name    ${tname:--} / ${plan:--} / ${status:--}"
+  if [ -n "$kp" ]; then
+    local_fp=$(_oci_fp_from_file "$kp") || local_fp=""
+    if [ -n "$local_fp" ] && [ -n "$fp" ] && [ "$local_fp" != "$(_oci_fp_normalize "$fp")" ]; then
+      echo "$(_t "⚠ 本地私钥指纹与配置指纹不一致：本地 %s / 配置 %s" "L_FP_MISMATCH_DETAIL" "$local_fp" "$fp")"
+    fi
+  else
+    echo "$(_t "⚠ 找不到本地私钥（无 .pem / 解密失败）" "L_NO_LOCAL_KEY")"
+  fi
+  echo
+  echo "── $(_t "OCI 配置（官方格式）" "L_OCI_CFG_OFFICIAL") ──"
+  cat <<EOF
+[DEFAULT]
+user=$user
+fingerprint=$fp
+tenancy=$tenancy
+region=$r
+key_file=$key_note
+EOF
+  echo
+  if [ -n "$kp" ]; then
     echo "── $(_t "公钥（由本地私钥导出）" "L_PUB_FROM_PRIV") ──"
     pub=$(_oci_pubkey_from_priv "$kp")
     if [ -n "$pub" ]; then echo "$pub"; else echo "$(_t "（导出失败）" "L_EXPORT_FAIL")"; fi
@@ -598,26 +618,20 @@ view_api_config(){
     echo "── $(_t "私钥（明文）" "L_PRIV_PLAIN") ──"
     cat "$kp"
     echo
-  else
-    echo "$(_t "⚠ 找不到本地私钥（无 .pem / 解密失败）" "L_NO_LOCAL_KEY")"
-  fi
-  # 云端 API key 列表（用当前本地密钥认证）
-  local r="$home"; [ "$r" = - ] && r=""; [ -z "$r" ] && r=$(name_to_region "$name")
-  [ -z "$r" ] && r="us-ashburn-1"
-  if [ -s "${kp:-}" ] || [ -s "$RUN_DIR/$name.pem" ]; then
-    local cfg; cfg=$(oci_cfg "$name" "$r")
-    cloud=$(oci --config-file "$cfg" --region "$r" iam user api-key list --user-id "$user" \
-      --query 'data[].{fp:fingerprint,time:"time-created",state:"lifecycle-state"}' --output table 2>&1) || true
-    echo "── $(_t "云端 API 公钥列表" "L_CLOUD_API_KEYS")（region=$r）──"
-    if echo "$cloud" | grep -qE 'fingerprint|fp'; then
-      echo "$cloud"
+    # 云端列表：精简一行指纹，不抢主视线
+    local cfg fps
+    cfg=$(oci_cfg "$name" "$r")
+    fps=$(oci --config-file "$cfg" --region "$r" iam user api-key list --user-id "$user" 2>/dev/null \
+      | jq -r '.data[].fingerprint // empty' 2>/dev/null)
+    echo "── $(_t "云端 API 指纹" "L_CLOUD_API_FPS")（$r）──"
+    if [ -n "$fps" ]; then
+      echo "$fps" | sed 's/^/  /'
     else
-      echo "$(_t "查询失败：" "L_QUERY_FAIL")$(_oci_err "$cloud")"
+      cloud=$(oci --config-file "$cfg" --region "$r" iam user api-key list --user-id "$user" 2>&1) || true
+      echo "  $(_t "查询失败：" "L_QUERY_FAIL")$(_oci_err "$cloud")"
     fi
   fi
-  line
 }
-
 replace_api_pubkey(){
   prepare_runtime
   list_accounts || return
@@ -2245,7 +2259,7 @@ _tz_pick(){
   fi
 }
 sys_menu(){ while true; do echo; echo "$(_t "── 系统配置 ──" "L_SYS_TITLE")"; echo " $(_t "1添加账号" "L_SYS_ADD_ACCOUNT") $(_t "2删除账号" "L_SYS_DEL_ACCOUNT") $(_t "3从oci-helper导入" "L_SYS_IMPORT_HELPER")"; echo " $(_t "4钉钉设置" "L_SYS_DINGTALK") $(_t "5Cloudflare设置" "L_SYS_CLOUDFLARE") $(_t "6验证租户可用性" "L_SYS_VERIFY") $(_t "7语言/Language" "L_SYS_LANG")"; echo " $(_t "8每日账单" "L_SYS_BILLING") $(_t "9密码设置" "L_SYS_PASSWD") $(_t "10时区" "L_SYS_TZ") $(_t "11安全巡检" "L_SYS_SECURITY")"; echo " $(_t "12查看API配置" "L_SYS_VIEW_API") $(_t "13更换API公钥" "L_SYS_REPLACE_API")"
-    echo " $(_t "0返回" "L_MENU_BACK")"; _ask -rp "$(_t "选择" "L_CHOOSE"): " x; case "$x" in 6)echo "$(_t "刷新信息不完整的账号..." "L_REFRESHING")"; verify_usability; pause;; 1)add_account;pause;; 2)del_account;pause;; 3)_ask -rp "$(_t "helper数据库" "L_HELPER_DB")[/app/oci-helper/oci-helper.db]: " db; import_from_helper "${db:-/app/oci-helper/oci-helper.db}"; pause;; 4)set_dingtalk;pause;; 5)set_cloudflare;pause;; 7)set_language;pause;; 8)billing_menu;; 9)set_password;pause;; 10)set_timezone;pause;; 11)security_inspection_menu;pause;; 12)view_api_config;pause;; 13)replace_api_pubkey;pause;; 0)return;; esac; done; }
+    echo " $(_t "0返回" "L_MENU_BACK")"; _ask -rp "$(_t "选择" "L_CHOOSE"): " x; case "$x" in 6)echo "$(_t "刷新信息不完整的账号..." "L_REFRESHING")"; verify_usability; pause;; 1)add_account;pause;; 2)del_account;pause;; 3)_ask -rp "$(_t "helper数据库" "L_HELPER_DB")[/app/oci-helper/oci-helper.db]: " db; import_from_helper "${db:-/app/oci-helper/oci-helper.db}"; pause;; 4)set_dingtalk;pause;; 5)set_cloudflare;pause;; 7)set_language;pause;; 8)billing_menu;; 9)set_password;pause;; 10)set_timezone;pause;; 11)security_inspection_menu;pause;; 12)view_api_config;; 13)replace_api_pubkey;pause;; 0)return;; esac; done; }
 # 语言切换
 set_language(){
   echo "$(_t "── 语言设置 ──" "L_LANG_TITLE")"

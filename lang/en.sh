@@ -447,3 +447,7 @@ L_TSV_FP_UPDATED="Updated accounts.tsv fingerprint -> %s"
 L_LOCAL_KEY_UNTOUCHED="Local private key file was NOT modified."
 L_REPLACE_LOCAL_HINT="IMPORTANT: replace keys/%s.pem (or .pem.enc) yourself with the private key matching the new public key, or this tool cannot auth that account."
 L_LOCAL_OK="Local private key already matches the new fingerprint; ready to use."
+
+L_OCI_CFG_OFFICIAL="OCI config (official format)"
+L_CLOUD_API_FPS="Cloud API fingerprints"
+L_FP_MISMATCH_DETAIL="WARNING: local private-key fingerprint != config fingerprint: local %s / config %s"
