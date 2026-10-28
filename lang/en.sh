@@ -451,3 +451,7 @@ L_LOCAL_OK="Local private key already matches the new fingerprint; ready to use.
 L_OCI_CFG_OFFICIAL="OCI config (official format)"
 L_CLOUD_API_FPS="Cloud API fingerprints"
 L_FP_MISMATCH_DETAIL="WARNING: local private-key fingerprint != config fingerprint: local %s / config %s"
+
+L_KEY_ENC_NOTE="WARNING: only encrypted key %s.pem.enc present; config key_file still uses official path %s (decrypted to memory at runtime)"
+
+L_LOCAL_KEY_PATH="Local private key path (for reference, not a config field): %s"
